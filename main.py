@@ -12,7 +12,6 @@ def main():
     bootstrap = ApplicationBootstrap()
     app = bootstrap.create_app()
     
-    # Register dedicated health route
     app.router.add_get("/health", health_check_handler)
     
     port = int(os.getenv("PORT", 10000))

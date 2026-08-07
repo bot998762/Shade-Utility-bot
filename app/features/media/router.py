@@ -68,7 +68,7 @@ async def cmd_qr(message: Message):
     bio = qr.generate_qr_buffer(args[1])
     try:
         input_file = BufferedInputFile(bio.getvalue(), filename="qrcode.png")
-        await message.reply_photo(photo=input_file, caption=f"🔳 **QR Code for:**\n`{args[1]}`", parse_mode="Markdown")
+        await message.reply_photo(photo=input_file, caption=f"MB **QR Code for:**\n`{args[1]}`", parse_mode="Markdown")
     finally:
         bio.close()
 

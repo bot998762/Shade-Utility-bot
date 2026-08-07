@@ -26,8 +26,16 @@ async def cmd_hash(message: Message):
     if len(args) < 2:
         await message.reply("❌ **Usage:** `/hash <text>`", parse_mode="Markdown")
         return
-    md5_val, sha256_val = crypto.gen_hashes(args[1])
-    await message.reply(f"🔐 **MD5:**\n`{md5_val}`\n\n**SHA-256:**\n`{sha256_val}`", parse_mode="Markdown")
+    md5_val, sha256_val, sha512_val = crypto.gen_hashes(args[1])
+    await message.reply(
+        f"🔐 **Cryptographic Hashes:**\n"
+        f"───────────────\n"
+        f"• **MD5:**\n`{md5_val}`\n\n"
+        f"• **SHA-256:**\n`{sha256_val}`\n\n"
+        f"• **SHA-512:**\n`{sha512_val}`\n"
+        f"───────────────",
+        parse_mode="Markdown"
+    )
 
 @router.message(Command("b64en"))
 async def cmd_b64en(message: Message):

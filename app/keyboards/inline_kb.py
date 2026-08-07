@@ -5,7 +5,7 @@ def main_menu_kb(bot_username: str = "ShadeUtilityBot"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🔑 String Session Gen", callback_data="cmd_string_info"),
-            InlineKeyboardButton(text="📄 PDF Tools", callback_data="coming_soon_pdf")
+            InlineKeyboardButton(text="🛠️ Dev Tools", callback_data="menu_utils")
         ],
         [
             InlineKeyboardButton(text="🎥 Media Tools", callback_data="coming_soon_media"),
