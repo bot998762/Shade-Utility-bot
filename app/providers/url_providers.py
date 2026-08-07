@@ -3,7 +3,6 @@ from urllib.parse import quote
 from app.core.config import settings
 
 class CleanURIProvider:
-    """Primary Zero-Delay Shortener"""
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
@@ -18,7 +17,6 @@ class CleanURIProvider:
             raise Exception("CleanURI Failed")
 
 class VGdURLProvider:
-    """Fallback Zero-Delay Shortener (v.gd)"""
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 

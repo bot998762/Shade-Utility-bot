@@ -4,7 +4,7 @@ def main_menu_kb(bot_username: str = "ShadeUtilityBot"):
     add_to_group_url = f"https://t.me/{bot_username}?startgroup=true"
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🖼️ Image Tools", callback_data="coming_soon_image"),
+            InlineKeyboardButton(text="🔑 String Session Gen", callback_data="cmd_string_info"),
             InlineKeyboardButton(text="📄 PDF Tools", callback_data="coming_soon_pdf")
         ],
         [
