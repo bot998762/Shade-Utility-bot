@@ -88,4 +88,4 @@ class ApplicationBootstrap:
     async def _rollback_resources(self):
         await self.bot.session.close()
         if self.http_session and not self.http_session.closed:
-            await self.http_session.closed()
+            await self.http_session.close()
