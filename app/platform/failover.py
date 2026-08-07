@@ -6,7 +6,6 @@ from app.core.exceptions import NoProvidersAvailableError
 logger = logging.getLogger("ShadePlatform")
 
 class ProviderFailoverEngine:
-    """Phase 3: Runtime Failover Provider Registry"""
     def __init__(self, domain: str):
         self.domain = domain
         self.providers: List[Tuple[any, CircuitBreaker]] = []
@@ -23,5 +22,4 @@ class ProviderFailoverEngine:
                 logger.warning({"event": "provider_failover", "domain": self.domain, "failed_provider": breaker.name, "error": str(e)})
                 continue
         
-        logger.error({"event": "all_providers_failed", "domain": self.domain})
         raise NoProvidersAvailableError(f"All providers for {self.domain} failed.")

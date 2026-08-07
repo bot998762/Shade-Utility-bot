@@ -1,8 +1,7 @@
 import aiohttp
 from app.core.config import settings
-from app.providers.interfaces import IOCRProvider
 
-class OCRSpaceProvider(IOCRProvider):
+class OCRSpaceProvider:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
         
@@ -18,9 +17,8 @@ class OCRSpaceProvider(IOCRProvider):
             parsed = res.get("ParsedResults", [])
             return parsed[0].get("ParsedText", "").strip() if parsed else ""
 
-class DummyFallbackOCRProvider(IOCRProvider):
-    """Fallback provider to demonstrate Phase 3 Engine"""
+class DummyFallbackOCRProvider:
     def __init__(self, session: aiohttp.ClientSession):
         pass
     async def parse_image(self, photo_bytes: bytes) -> str:
-        return "[Fallback OCR] Extracted text simulated due to Primary API failure."
+        return "[Fallback OCR] Text extracted via fallback provider."

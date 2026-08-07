@@ -1,4 +1,4 @@
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter
 
 class MetricsRegistry:
     def __init__(self):

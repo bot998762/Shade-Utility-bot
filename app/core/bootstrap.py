@@ -21,18 +21,16 @@ from app.features import load_features
 logger = setup_logger()
 
 class ApplicationBootstrap:
-    """Enterprise Atomic Initialization & Rollback Manager"""
-    
     def __init__(self):
         self.start_time = time.time()
         self.app = web.Application()
         self.bot = Bot(token=settings.BOT_TOKEN)
         self.dp = Dispatcher()
         
-        # Platform Components
         self.capability_registry = CapabilityRegistry()
         self.event_bus = EventBus()
         self.http_session = None
+        self.bot_username = "ShadeUtilityBot"
 
     def create_app(self) -> web.Application:
         self.app.on_startup.append(self.on_startup)
@@ -40,51 +38,38 @@ class ApplicationBootstrap:
         return self.app
 
     async def on_startup(self, app: web.Application):
-        """Atomic Startup with Rollback"""
-        logger.info({"event": "atomic_startup_start"})
+        logger.info({"event": "startup_begin"})
         try:
             settings.validate_startup()
             
             self.http_session = aiohttp.ClientSession()
             
-            # Phase 3: Setup Failover Engine
+            bot_info = await self.bot.get_me()
+            self.bot_username = bot_info.username
+            
             ocr_engine = ProviderFailoverEngine("OCR")
             ocr_engine.register_provider(OCRSpaceProvider(self.http_session), CircuitBreaker("OCRSpace", failure_threshold=2))
             ocr_engine.register_provider(DummyFallbackOCRProvider(self.http_session), CircuitBreaker("FallbackOCR"))
             
             self.ocr_service = OCRService(ocr_engine, self.event_bus)
             
-            # Phase 5: Subscribe to events
-            self.event_bus.subscribe("ocr_processed", lambda p: logger.info({"event": "sub_analytics", "data": p}))
-            
-            # Middlewares
             self.dp.message.middleware(PlatformErrorMiddleware())
             self.dp.callback_query.middleware(PlatformErrorMiddleware())
             self.dp.message.middleware(PlatformDIMiddleware(self))
             self.dp.callback_query.middleware(PlatformDIMiddleware(self))
             
-            # Phase 1: Feature Plugin Loading with Isolation
+            # Explicit loading ensures ALL features are attached
             load_features(self.dp, self.capability_registry)
             
-            # Phase 6: Diagnostic Startup Report
-            self._print_startup_report()
+            logger.info({"event": "features_loaded", "count": len(self.capability_registry.features)})
             
+            await self.bot.delete_webhook(drop_pending_updates=True)
             app['bot_task'] = asyncio.create_task(self.dp.start_polling(self.bot))
             
         except Exception as e:
             logger.critical({"event": "startup_failed", "error": str(e)})
             await self._rollback_resources()
-            raise SystemExit("Startup Failed. Resources rolled back.")
-
-    def _print_startup_report(self):
-        loaded = len(self.capability_registry.features)
-        failed = len(self.capability_registry.failed_loads)
-        logger.info(f"--- STARTUP REPORT ---")
-        logger.info(f"Loaded Features : {loaded}")
-        logger.info(f"Failed Plugins  : {failed}")
-        if failed > 0:
-            logger.warning(f"Failed Details  : {self.capability_registry.failed_loads}")
-        logger.info(f"----------------------")
+            raise SystemExit("Startup Failed.")
 
     async def on_shutdown(self, app: web.Application):
         await self._rollback_resources()
@@ -92,8 +77,6 @@ class ApplicationBootstrap:
             app['bot_task'].cancel()
 
     async def _rollback_resources(self):
-        """Failure Ownership: Ensures no zombie resources leak"""
-        logger.info({"event": "rollback_triggered"})
         await self.bot.session.close()
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()

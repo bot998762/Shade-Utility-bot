@@ -8,6 +8,5 @@ class OCRService:
 
     async def extract_text(self, photo_bytes: bytes, user_id: int) -> str:
         text = await self.engine.execute("parse_image", photo_bytes)
-        # Phase 5: Emit domain event
         self.event_bus.publish("ocr_processed", {"user_id": user_id, "length": len(text)})
         return text

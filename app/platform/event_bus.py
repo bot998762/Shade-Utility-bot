@@ -5,7 +5,6 @@ from app.core.metrics import metrics
 logger = logging.getLogger("ShadePlatform")
 
 class EventBus:
-    """Phase 5: Domain Event Bus for Decoupling"""
     def __init__(self):
         self.subscribers = {}
 

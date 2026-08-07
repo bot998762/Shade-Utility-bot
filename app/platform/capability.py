@@ -11,7 +11,6 @@ class FeatureManifest:
     enabled: bool = True
 
 class CapabilityRegistry:
-    """Phase 1 & 2: Capability Registry and Runtime Feature Flags"""
     def __init__(self):
         self.features: Dict[str, FeatureManifest] = {}
         self.failed_loads: Dict[str, str] = {}
@@ -19,12 +18,9 @@ class CapabilityRegistry:
     def register(self, manifest: FeatureManifest):
         self.features[manifest.name] = manifest
 
-    def record_failure(self, name: str, reason: str):
-        self.failed_loads[name] = reason
-
     def is_enabled(self, name: str) -> bool:
         feat = self.features.get(name)
-        return feat.enabled if feat else False
+        return feat.enabled if feat else True
 
     def toggle(self, name: str, state: bool) -> bool:
         if name in self.features:
