@@ -19,20 +19,12 @@ async def cmd_diag(message: Message, registry: CapabilityRegistry, bootstrap_ref
     disabled = sum(1 for f in registry.features.values() if not f.enabled)
     
     report = (
-        f"🤖 **Shade Utility Control Plane**
-
-"
-        f"**Features**
-"
-        f"Loaded    : `{loaded}`
-"
-        f"Disabled  : `{disabled}`
-
-"
-        f"**Resources**
-"
-        f"HTTP Pool : `{'OK' if bootstrap_ref.http_session else 'FAIL'}`
-"
+        f"🤖 **Shade Utility Control Plane**\n\n"
+        f"**Features**\n"
+        f"Loaded    : `{loaded}`\n"
+        f"Disabled  : `{disabled}`\n\n"
+        f"**Resources**\n"
+        f"HTTP Pool : `{'OK' if bootstrap_ref.http_session else 'FAIL'}`\n"
         f"Uptime    : `{uptime:.2f} sec`"
     )
     await message.reply(report, parse_mode="Markdown")
@@ -42,13 +34,9 @@ async def cmd_health(message: Message, bootstrap_ref):
     process = psutil.Process()
     mem_mb = process.memory_info().rss / (1024 * 1024)
     status = (
-        f"🏥 **System Health Status**
-
-"
-        f"• **Status:** Operational 🟢
-"
-        f"• **RAM Usage:** `{mem_mb:.2f} MB`
-"
+        f"🏥 **System Health Status**\n\n"
+        f"• **Status:** Operational 🟢\n"
+        f"• **RAM Usage:** `{mem_mb:.2f} MB`\n"
         f"• **HTTP Session:** `{'Active' if bootstrap_ref.http_session else 'Closed'}`"
     )
     await message.reply(status, parse_mode="Markdown")

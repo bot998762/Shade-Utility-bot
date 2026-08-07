@@ -3,7 +3,6 @@ from urllib.parse import quote
 from app.core.config import settings
 
 class IsGdURLProvider:
-    """Fast Direct Link Shortener with 0s Delay"""
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
