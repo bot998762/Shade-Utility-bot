@@ -2,14 +2,31 @@ import aiohttp
 from urllib.parse import quote
 from app.core.config import settings
 
-class IsGdURLProvider:
+class TinyURLProvider:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
     async def create_short_url(self, target_url: str) -> str:
         encoded_url = quote(target_url, safe='')
-        api_url = f"https://is.gd/create.php?format=simple&url={encoded_url}"
+        api_url = f"https://tinyurl.com/api-create.php?url={encoded_url}"
         timeout = aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT)
         async with self.session.get(api_url, timeout=timeout) as resp:
             resp.raise_for_status()
-            return await resp.text()
+            res_text = await resp.text()
+            if "Error" in res_text or not res_text.startswith("http"):
+                raise Exception(f"TinyURL Error: {res_text}")
+            return res_text.strip()
+
+class CleanURIProvider:
+    def __init__(self, session: aiohttp.ClientSession):
+        self.session = session
+
+    async def create_short_url(self, target_url: str) -> str:
+        api_url = "https://cleanuri.com/api/v1/shorten"
+        timeout = aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT)
+        async with self.session.post(api_url, data={'url': target_url}, timeout=timeout) as resp:
+            resp.raise_for_status()
+            res_json = await resp.json()
+            if 'result_url' in res_json:
+                return res_json['result_url']
+            raise Exception("CleanURI Failed")

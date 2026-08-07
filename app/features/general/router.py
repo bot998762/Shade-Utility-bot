@@ -15,7 +15,7 @@ UTILS_LIST = (
     "🔢 `/b64en <text>` ➔ Base64 Encode\n"
     "🔡 `/b64de <text>` ➔ Base64 Decode\n"
     "⏰ `/time` ➔ Current Unix Timestamp\n"
-    "🌐 `/short <url>` ➔ Shorten Long Link (Direct)\n"
+    "🌐 `/short <url>` ➔ Shorten Long Link\n"
     "🔳 `/qr <text/url>` ➔ Generate QR Code\n"
     "🔍 Reply with `/qrscan` ➔ Scan QR Code Image\n"
     "🌍 Reply with `/tr <lang>` ➔ Translate Text\n"
