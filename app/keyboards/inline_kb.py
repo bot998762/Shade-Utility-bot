@@ -4,19 +4,22 @@ def main_menu_kb(bot_username: str = "ShadeUtilityBot"):
     add_to_group_url = f"https://t.me/{bot_username}?startgroup=true"
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🔑 String Session Gen", callback_data="cmd_string_info"),
-            InlineKeyboardButton(text="🛠️ Dev Tools", callback_data="menu_utils")
+            InlineKeyboardButton(text="🛠️ Developer Tools", callback_data="cat_dev"),
+            InlineKeyboardButton(text="🔑 String Session", callback_data="cat_session")
         ],
         [
-            InlineKeyboardButton(text="🎥 Media Tools", callback_data="coming_soon_media"),
-            InlineKeyboardButton(text="⚙️ All Utilities", callback_data="menu_utils")
+            InlineKeyboardButton(text="📸 Media & OCR", callback_data="cat_media"),
+            InlineKeyboardButton(text="🌐 Web & Utilities", callback_data="cat_web")
         ],
         [
-            InlineKeyboardButton(text="➕ Add Me To Your Group 👥", url=add_to_group_url)
+            InlineKeyboardButton(text="📘 Full Manual & Manuals (/help)", callback_data="menu_help")
+        ],
+        [
+            InlineKeyboardButton(text="➕ Add Bot to Telegram Group 👥", url=add_to_group_url)
         ]
     ])
 
-def utils_menu_kb():
+def category_dev_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="back_main")]
     ])

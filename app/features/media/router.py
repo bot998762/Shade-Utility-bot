@@ -14,10 +14,10 @@ router = Router()
 async def cmd_ocr(message: Message, bot: Bot, ocr_service: OCRService, registry: CapabilityRegistry):
     registry.require("MediaTools")
     if not message.reply_to_message or not message.reply_to_message.photo:
-        await message.reply("❌ Reply to an image with `/ocr` to extract text.")
+        await message.reply("❌ Reply to an image message with `/ocr`.")
         return
         
-    status = await message.reply("📝 Processing image...")
+    status = await message.reply("📝 Processing Image OCR...")
     photo = message.reply_to_message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
     photo_bytes = await bot.download_file(file_info.file_path)
@@ -25,10 +25,14 @@ async def cmd_ocr(message: Message, bot: Bot, ocr_service: OCRService, registry:
     extracted_text = await ocr_service.extract_text(photo_bytes.read(), message.from_user.id)
     
     if extracted_text:
-        res_text = f"📝 **Extracted Text Result:**\n───────────────\n`{extracted_text}`\n───────────────\n💡 *Tip: Tap on text to copy!*"
+        res_text = f"📝 **OCR Extracted Result:**
+───────────────────────────
+`{extracted_text}`
+───────────────────────────
+💡 *Tap text block to copy.*"
         await status.edit_text(res_text, parse_mode="Markdown")
     else:
-        await status.edit_text("❌ No readable text found in image.")
+        await status.edit_text("❌ No optical text detected in image payload.")
 
 @router.message(Command("short"))
 async def cmd_short(message: Message, shortener_service: ShortenerService):
@@ -37,7 +41,8 @@ async def cmd_short(message: Message, shortener_service: ShortenerService):
         await message.reply("❌ **Usage:** `/short <url>`", parse_mode="Markdown")
         return
     url = await shortener_service.shorten_url(args[1].strip())
-    await message.reply(f"🌐 **Shortened Direct Link:**\n{url}", parse_mode="Markdown")
+    await message.reply(f"🌐 **Shortened Direct Link:**
+{url}", parse_mode="Markdown")
 
 @router.message(Command("tr"))
 async def cmd_translate(message: Message, translator_service: TranslatorService):
@@ -50,12 +55,13 @@ async def cmd_translate(message: Message, translator_service: TranslatorService)
         text = message.text.split(maxsplit=2)[2]
 
     if not text:
-        await message.reply("❌ Reply to text or type: `/tr <lang> <text>`", parse_mode="Markdown")
+        await message.reply("❌ Reply to text or format: `/tr <lang> <text>`", parse_mode="Markdown")
         return
 
     try:
         translated = await translator_service.translate(text, target_lang)
-        await message.reply(f"🌍 **Translation ({target_lang}):**\n{translated}")
+        await message.reply(f"🌍 **Translation ({target_lang.upper()}):**
+{translated}")
     except ValueError as ve:
         await message.reply(f"❌ {str(ve)}")
 
@@ -68,18 +74,20 @@ async def cmd_qr(message: Message):
     bio = qr.generate_qr_buffer(args[1])
     try:
         input_file = BufferedInputFile(bio.getvalue(), filename="qrcode.png")
-        await message.reply_photo(photo=input_file, caption=f"MB **QR Code for:**\n`{args[1]}`", parse_mode="Markdown")
+        await message.reply_photo(photo=input_file, caption=f"🔳 **Generated QR Code Matrix:**
+`{args[1]}`", parse_mode="Markdown")
     finally:
         bio.close()
 
 @router.message(Command("qrscan"))
 async def cmd_qrscan(message: Message, bot: Bot):
     if not message.reply_to_message or not message.reply_to_message.photo:
-        await message.reply("❌ Reply to a QR photo with `/qrscan`.")
+        await message.reply("❌ Reply to a QR photo message with `/qrscan`.")
         return
-    status = await message.reply("🔍 Scanning...")
+    status = await message.reply("🔍 Scanning QR Code Payload...")
     photo = message.reply_to_message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
     photo_bytes = await bot.download_file(file_info.file_path)
     res = qr.scan_qr_from_bytes(photo_bytes.read())
-    await status.edit_text(f"✅ **QR Result:**\n`{res}`" if res else "❌ No QR code detected.", parse_mode="Markdown")
+    await status.edit_text(f"✅ **Decoded QR Output:**
+`{res}`" if res else "❌ No QR code detected in image.", parse_mode="Markdown")

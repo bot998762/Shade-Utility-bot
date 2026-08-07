@@ -13,9 +13,9 @@ class PlatformErrorMiddleware(BaseMiddleware):
             if isinstance(event, Message): await event.reply(f"🔒 {str(e)}")
             elif isinstance(event, CallbackQuery): await event.answer(str(e), show_alert=True)
         except NoProvidersAvailableError:
-            msg = "⚠️ Service is completely down. All fallback providers failed."
+            msg = "⚠️ Service is temporarily unavailable. Please try again later."
             if isinstance(event, Message): await event.reply(msg)
             elif isinstance(event, CallbackQuery): await event.answer(msg, show_alert=True)
         except Exception as e:
             logger.error({"event": "unhandled_error", "error": str(e)}, exc_info=True)
-            if isinstance(event, Message): await event.reply("⚠️ Internal system error.")
+            if isinstance(event, Message): await event.reply("⚠️ Internal system error occurred.")
