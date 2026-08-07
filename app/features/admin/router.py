@@ -4,7 +4,6 @@ from aiogram.types import Message
 from aiogram.filters import Command
 from app.platform.capability import FeatureManifest, CapabilityRegistry
 from app.core.config import settings
-from app.core.bootstrap import ApplicationBootstrap
 
 manifest = FeatureManifest(name="AdminControl", version="1.0.0", category="System", is_premium=True)
 router = Router()
@@ -13,7 +12,7 @@ def is_admin(message: Message):
     return message.from_user.id == settings.ADMIN_ID
 
 @router.message(Command("diag"), F.func(is_admin))
-async def cmd_diag(message: Message, registry: CapabilityRegistry, bootstrap_ref: ApplicationBootstrap):
+async def cmd_diag(message: Message, registry: CapabilityRegistry, bootstrap_ref):
     """Phase 6: Self Diagnostics & Phase 4: Operational Control"""
     uptime = time.time() - bootstrap_ref.start_time
     loaded = len(registry.features)

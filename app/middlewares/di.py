@@ -1,9 +1,8 @@
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
-from app.core.bootstrap import ApplicationBootstrap
 
 class PlatformDIMiddleware(BaseMiddleware):
-    def __init__(self, bootstrap: ApplicationBootstrap):
+    def __init__(self, bootstrap):
         self.bootstrap = bootstrap
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
