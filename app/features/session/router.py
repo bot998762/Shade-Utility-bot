@@ -13,18 +13,11 @@ async def cmd_string_gen(message: Message):
     args = message.text.split()
     if len(args) < 4:
         await message.reply(
-            "🔑 **Telegram String Session Generator**
-───────────────────────────
-"
-            "📌 **Usage Format:**
-"
-            "`/string <API_ID> <API_HASH> <PHONE_NUMBER>`
-
-"
-            "💡 **Example:**
-"
-            "`/string 1234567 0123456789abcdef0123456789abcdef +919876543210`
-"
+            "🔑 **Telegram String Session Generator**\n───────────────────────────\n"
+            "📌 **Usage Format:**\n"
+            "`/string <API_ID> <API_HASH> <PHONE_NUMBER>`\n\n"
+            "💡 **Example:**\n"
+            "`/string 1234567 0123456789abcdef0123456789abcdef +919876543210`\n"
             "───────────────────────────",
             parse_mode="Markdown"
         )
@@ -47,11 +40,8 @@ async def cmd_string_gen(message: Message):
         if not await client.is_user_authorized():
             await client.send_code_request(phone)
             await status.edit_text(
-                "📩 **OTP Authorization Sent via Telegram!**
-───────────────────────────
-"
-                "Check your official Telegram client for authentication code.
-"
+                "📩 **OTP Authorization Sent via Telegram!**\n───────────────────────────\n"
+                "Check your official Telegram client for authentication code.\n"
                 "*(Send code formatted with spaces like `1 2 3 4 5` to prevent revocation)*",
                 parse_mode="Markdown"
             )
@@ -59,8 +49,6 @@ async def cmd_string_gen(message: Message):
         else:
             session_str = client.session.save()
             await client.disconnect()
-            await status.edit_text(f"✅ **Generated String Session:**
-
-`{session_str}`", parse_mode="Markdown")
+            await status.edit_text(f"✅ **Generated String Session:**\n\n`{session_str}`", parse_mode="Markdown")
     except Exception as e:
         await status.edit_text(f"❌ **Authentication Error:** `{str(e)}`", parse_mode="Markdown")

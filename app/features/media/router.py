@@ -25,11 +25,7 @@ async def cmd_ocr(message: Message, bot: Bot, ocr_service: OCRService, registry:
     extracted_text = await ocr_service.extract_text(photo_bytes.read(), message.from_user.id)
     
     if extracted_text:
-        res_text = f"📝 **OCR Extracted Result:**
-───────────────────────────
-`{extracted_text}`
-───────────────────────────
-💡 *Tap text block to copy.*"
+        res_text = f"📝 **OCR Extracted Result:**\n───────────────────────────\n`{extracted_text}`\n───────────────────────────\n💡 *Tap text block to copy.*"
         await status.edit_text(res_text, parse_mode="Markdown")
     else:
         await status.edit_text("❌ No optical text detected in image payload.")
@@ -41,8 +37,7 @@ async def cmd_short(message: Message, shortener_service: ShortenerService):
         await message.reply("❌ **Usage:** `/short <url>`", parse_mode="Markdown")
         return
     url = await shortener_service.shorten_url(args[1].strip())
-    await message.reply(f"🌐 **Shortened Direct Link:**
-{url}", parse_mode="Markdown")
+    await message.reply(f"🌐 **Shortened Direct Link:**\n{url}", parse_mode="Markdown")
 
 @router.message(Command("tr"))
 async def cmd_translate(message: Message, translator_service: TranslatorService):
@@ -60,8 +55,7 @@ async def cmd_translate(message: Message, translator_service: TranslatorService)
 
     try:
         translated = await translator_service.translate(text, target_lang)
-        await message.reply(f"🌍 **Translation ({target_lang.upper()}):**
-{translated}")
+        await message.reply(f"🌍 **Translation ({target_lang.upper()}):**\n{translated}")
     except ValueError as ve:
         await message.reply(f"❌ {str(ve)}")
 
@@ -74,8 +68,7 @@ async def cmd_qr(message: Message):
     bio = qr.generate_qr_buffer(args[1])
     try:
         input_file = BufferedInputFile(bio.getvalue(), filename="qrcode.png")
-        await message.reply_photo(photo=input_file, caption=f"🔳 **Generated QR Code Matrix:**
-`{args[1]}`", parse_mode="Markdown")
+        await message.reply_photo(photo=input_file, caption=f"🔳 **Generated QR Code Matrix:**\n`{args[1]}`", parse_mode="Markdown")
     finally:
         bio.close()
 
@@ -89,5 +82,4 @@ async def cmd_qrscan(message: Message, bot: Bot):
     file_info = await bot.get_file(photo.file_id)
     photo_bytes = await bot.download_file(file_info.file_path)
     res = qr.scan_qr_from_bytes(photo_bytes.read())
-    await status.edit_text(f"✅ **Decoded QR Output:**
-`{res}`" if res else "❌ No QR code detected in image.", parse_mode="Markdown")
+    await status.edit_text(f"✅ **Decoded QR Output:**\n`{res}`" if res else "❌ No QR code detected in image.", parse_mode="Markdown")

@@ -12,7 +12,7 @@ def main_menu_kb(bot_username: str = "ShadeUtilityBot"):
             InlineKeyboardButton(text="🌐 Web & Utilities", callback_data="cat_web")
         ],
         [
-            InlineKeyboardButton(text="📘 Full Manual & Manuals (/help)", callback_data="menu_help")
+            InlineKeyboardButton(text="📘 Full Manual (/help)", callback_data="menu_help")
         ],
         [
             InlineKeyboardButton(text="➕ Add Bot to Telegram Group 👥", url=add_to_group_url)
