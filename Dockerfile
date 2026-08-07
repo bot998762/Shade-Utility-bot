@@ -1,7 +1,6 @@
 FROM python:3.11-slim
 WORKDIR /app
 
-# Install system dependencies required by pyzbar (libzbar0)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libzbar0 \
     && rm -rf /var/lib/apt/lists/*
