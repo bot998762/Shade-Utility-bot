@@ -12,7 +12,7 @@ from app.platform.failover import ProviderFailoverEngine
 from app.core.circuit_breaker import CircuitBreaker
 
 from app.providers.ocr_providers import OCRSpaceProvider, DummyFallbackOCRProvider
-from app.providers.url_providers import TinyURLProvider, CleanURIProvider
+from app.providers.url_providers import CleanURIProvider, VGdURLProvider
 from app.services.ocr_service import OCRService
 from app.services.shortener_service import ShortenerService
 from app.services.translator_service import TranslatorService
@@ -56,8 +56,8 @@ class ApplicationBootstrap:
             ocr_engine.register_provider(DummyFallbackOCRProvider(self.http_session), CircuitBreaker("FallbackOCR"))
             
             url_engine = ProviderFailoverEngine("URLShortener")
-            url_engine.register_provider(TinyURLProvider(self.http_session), CircuitBreaker("TinyURL", failure_threshold=2))
             url_engine.register_provider(CleanURIProvider(self.http_session), CircuitBreaker("CleanURI", failure_threshold=2))
+            url_engine.register_provider(VGdURLProvider(self.http_session), CircuitBreaker("VGdURL", failure_threshold=2))
             
             self.ocr_service = OCRService(ocr_engine, self.event_bus)
             self.shortener_service = ShortenerService(url_engine)
