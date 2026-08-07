@@ -1,4 +1,5 @@
 import time
+import psutil
 from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.filters import Command
@@ -27,3 +28,15 @@ async def cmd_diag(message: Message, registry: CapabilityRegistry, bootstrap_ref
         f"Uptime    : `{uptime:.2f} sec`"
     )
     await message.reply(report, parse_mode="Markdown")
+
+@router.message(Command("health"))
+async def cmd_health(message: Message, bootstrap_ref):
+    process = psutil.Process()
+    mem_mb = process.memory_info().rss / (1024 * 1024)
+    status = (
+        f"🏥 **System Health Status**\n\n"
+        f"• **Status:** Operational 🟢\n"
+        f"• **RAM Usage:** `{mem_mb:.2f} MB`\n"
+        f"• **HTTP Session:** `{'Active' if bootstrap_ref.http_session else 'Closed'}`"
+    )
+    await message.reply(status, parse_mode="Markdown")

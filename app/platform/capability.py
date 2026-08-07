@@ -13,7 +13,6 @@ class FeatureManifest:
 class CapabilityRegistry:
     def __init__(self):
         self.features: Dict[str, FeatureManifest] = {}
-        self.failed_loads: Dict[str, str] = {}
 
     def register(self, manifest: FeatureManifest):
         self.features[manifest.name] = manifest

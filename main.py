@@ -6,7 +6,7 @@ from app.core.logger import setup_logger
 logger = setup_logger()
 
 def main():
-    logger.info({"event": "process_start", "message": "Bootstrapping Shade Utility Bot"})
+    logger.info({"event": "process_start", "message": "Bootstrapping Shade Utility Platform V8"})
     
     bootstrap = ApplicationBootstrap()
     app = bootstrap.create_app()
