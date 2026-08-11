@@ -9,7 +9,7 @@ from aiogram.fsm.state import StatesGroup, State
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
-# Feature Manifest expected as an Object with dot attributes by capability.py
+# Feature Manifest required by app/features/__init__.py
 manifest = SimpleNamespace(
     name="session",
     description="Telegram String Session Generator Feature",
@@ -157,7 +157,7 @@ async def process_2fa(message: Message, state: FSMContext):
         if user_id in ACTIVE_CLIENTS:
             del ACTIVE_CLIENTS[user_id]
         await state.clear()
-        await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
+        await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")parse_mode="Markdown")
        del ACTIVE_CLIENTS[user_id]
         await state.clear()
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
