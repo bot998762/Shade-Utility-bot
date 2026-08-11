@@ -8,9 +8,16 @@ from aiogram.fsm.state import StatesGroup, State
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
+# Feature Manifest required by app/features/__init__.py
+manifest = {
+    "name": "session",
+    "description": "Telegram String Session Generator Feature",
+    "version": "1.0.0"
+}
+
 router = Router()
 
-# Global runtime cache for Telethon client instances (Prevents FSM Serialization Crashes)
+# Global runtime memory cache for Telethon clients
 ACTIVE_CLIENTS = {}
 
 class StringSessionState(StatesGroup):
@@ -35,7 +42,6 @@ async def cmd_string(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
 
-    # Disconnect any existing hanging client for this user
     if user_id in ACTIVE_CLIENTS:
         try:
             await ACTIVE_CLIENTS[user_id]["client"].disconnect()
@@ -43,27 +49,24 @@ async def cmd_string(message: Message, state: FSMContext):
             pass
         del ACTIVE_CLIENTS[user_id]
 
-    # Create new isolated Telethon Client
     client = TelegramClient(None, api_id, api_hash)
     await client.connect()
 
     try:
         sent_code = await client.send_code_request(phone_number)
         
-        # Save client object in global memory cache
         ACTIVE_CLIENTS[user_id] = {
             "client": client,
             "phone_number": phone_number,
             "phone_code_hash": sent_code.phone_code_hash
         }
 
-        # Set FSM state to explicitly listen for next message
         await state.set_state(StringSessionState.waiting_for_otp)
 
         await message.reply(
             "📩 **OTP Authorization Sent via Telegram!**\n\n"
             "Check your official Telegram client for authentication code.\n"
-            "Simply type or send your code below (e.g. `82123` or `8 2 1 2 3`).",
+            "Simply send code below (e.g. `82123` or `8 2 1 2 3`).",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -73,21 +76,20 @@ async def cmd_string(message: Message, state: FSMContext):
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
 
 
-# OTP Capture Handler (FSM State Filtered)
 @router.message(StringSessionState.waiting_for_otp)
 async def process_otp(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     if user_id not in ACTIVE_CLIENTS:
         await state.clear()
-        await message.reply("❌ Session timed out or expired. Please start again with `/string` command.")
+        await message.reply("❌ Session timed out. Please run `/string` command again.")
         return
 
-    # Auto-extract numbers only (Cleans spaces, quotes, newlines, hyphens)
+    # Extracts only numeric digits from user message
     raw_code = re.sub(r"\D", "", message.text.strip())
 
     if not raw_code:
-        await message.reply("⚠️ Invalid OTP format. Please send valid numbers.")
+        await message.reply("⚠️ Invalid OTP format. Please send digits only.")
         return
 
     session_data = ACTIVE_CLIENTS[user_id]
@@ -115,7 +117,7 @@ async def process_otp(message: Message, state: FSMContext):
         await message.reply("🔐 **2FA Password Required!**\nPlease enter your Two-Step Verification password below.")
 
     except PhoneCodeInvalidError:
-        await message.reply("❌ **Invalid OTP Code.** Please double-check and send the code again.")
+        await message.reply("❌ **Invalid OTP Code.** Please double check and send again.")
 
     except Exception as e:
         await client.disconnect()
@@ -125,14 +127,13 @@ async def process_otp(message: Message, state: FSMContext):
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
 
 
-# 2FA Password Handler
 @router.message(StringSessionState.waiting_for_2fa)
 async def process_2fa(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     if user_id not in ACTIVE_CLIENTS:
         await state.clear()
-        await message.reply("❌ Session expired. Please start again with `/string`.")
+        await message.reply("❌ Session expired. Please restart with `/string`.")
         return
 
     password = message.text.strip()
@@ -152,6 +153,11 @@ async def process_2fa(message: Message, state: FSMContext):
         )
     except Exception as e:
         await client.disconnect()
+        if user_id in ACTIVE_CLIENTS:
+            del ACTIVE_CLIENTS[user_id]
+        await state.clear()
+        await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
+lient.disconnect()
         if user_id in ACTIVE_CLIENTS:
             del ACTIVE_CLIENTS[user_id]
         await state.clear()
