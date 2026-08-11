@@ -1,5 +1,6 @@
 import re
 import asyncio
+from types import SimpleNamespace
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -8,12 +9,12 @@ from aiogram.fsm.state import StatesGroup, State
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
-# Feature Manifest required by app/features/__init__.py
-manifest = {
-    "name": "session",
-    "description": "Telegram String Session Generator Feature",
-    "version": "1.0.0"
-}
+# Feature Manifest expected as an Object with dot attributes by capability.py
+manifest = SimpleNamespace(
+    name="session",
+    description="Telegram String Session Generator Feature",
+    version="1.0.0"
+)
 
 router = Router()
 
@@ -157,8 +158,6 @@ async def process_2fa(message: Message, state: FSMContext):
             del ACTIVE_CLIENTS[user_id]
         await state.clear()
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
-lient.disconnect()
-        if user_id in ACTIVE_CLIENTS:
-            del ACTIVE_CLIENTS[user_id]
+       del ACTIVE_CLIENTS[user_id]
         await state.clear()
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
