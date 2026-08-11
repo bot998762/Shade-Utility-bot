@@ -157,7 +157,4 @@ async def process_2fa(message: Message, state: FSMContext):
         if user_id in ACTIVE_CLIENTS:
             del ACTIVE_CLIENTS[user_id]
         await state.clear()
-        await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")parse_mode="Markdown")
-       del ACTIVE_CLIENTS[user_id]
-        await state.clear()
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
