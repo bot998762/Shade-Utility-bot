@@ -1,4 +1,5 @@
 import re
+import asyncio
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -9,10 +10,13 @@ from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
 router = Router()
 
-# Dedicated FSM State for String Session
+# Global runtime cache for Telethon client instances (Prevents FSM Serialization Crashes)
+ACTIVE_CLIENTS = {}
+
 class StringSessionState(StatesGroup):
     waiting_for_otp = State()
     waiting_for_2fa = State()
+
 
 @router.message(Command("string"))
 async def cmd_string(message: Message, state: FSMContext):
@@ -21,62 +25,84 @@ async def cmd_string(message: Message, state: FSMContext):
         await message.reply("⚠️ **Usage:** `/string <api_id> <api_hash> <phone_number>`", parse_mode="Markdown")
         return
 
-    api_id = int(args[1])
-    api_hash = args[2]
-    phone_number = args[3]
+    try:
+        api_id = int(args[1])
+        api_hash = args[2].strip()
+        phone_number = args[3].strip()
+    except ValueError:
+        await message.reply("❌ Invalid API ID. It must be a number.")
+        return
 
+    user_id = message.from_user.id
+
+    # Disconnect any existing hanging client for this user
+    if user_id in ACTIVE_CLIENTS:
+        try:
+            await ACTIVE_CLIENTS[user_id]["client"].disconnect()
+        except Exception:
+            pass
+        del ACTIVE_CLIENTS[user_id]
+
+    # Create new isolated Telethon Client
     client = TelegramClient(None, api_id, api_hash)
     await client.connect()
-    
+
     try:
         sent_code = await client.send_code_request(phone_number)
         
-        # Save temp memory into FSM context
-        await state.update_data(
-            api_id=api_id,
-            api_hash=api_hash,
-            phone_number=phone_number,
-            phone_code_hash=sent_code.phone_code_hash,
-            client=client
-        )
-        
-        # ACTIVATE STATE TO LISTEN TO NEXT OTP MESSAGE
+        # Save client object in global memory cache
+        ACTIVE_CLIENTS[user_id] = {
+            "client": client,
+            "phone_number": phone_number,
+            "phone_code_hash": sent_code.phone_code_hash
+        }
+
+        # Set FSM state to explicitly listen for next message
         await state.set_state(StringSessionState.waiting_for_otp)
-        
+
         await message.reply(
             "📩 **OTP Authorization Sent via Telegram!**\n\n"
             "Check your official Telegram client for authentication code.\n"
-            "Send code formatted like `1 2 3 4 5` or `12345`.",
+            "Simply type or send your code below (e.g. `82123` or `8 2 1 2 3`).",
             parse_mode="Markdown"
         )
     except Exception as e:
         await client.disconnect()
+        if user_id in ACTIVE_CLIENTS:
+            del ACTIVE_CLIENTS[user_id]
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
 
 
-# OTP Handler (Fixes spaces & captures user input properly)
+# OTP Capture Handler (FSM State Filtered)
 @router.message(StringSessionState.waiting_for_otp)
 async def process_otp(message: Message, state: FSMContext):
-    # Auto-clean spaces, backticks, or dashes entered by user
-    raw_code = message.text.replace(" ", "").replace("`", "").replace("-", "").strip()
-    
-    if not raw_code.isdigit():
-        await message.reply("⚠️ Invalid OTP format. Please send digits only (e.g. `3 7 1 5 9`).")
+    user_id = message.from_user.id
+
+    if user_id not in ACTIVE_CLIENTS:
+        await state.clear()
+        await message.reply("❌ Session timed out or expired. Please start again with `/string` command.")
         return
 
-    data = await state.get_data()
-    client: TelegramClient = data["client"]
+    # Auto-extract numbers only (Cleans spaces, quotes, newlines, hyphens)
+    raw_code = re.sub(r"\D", "", message.text.strip())
+
+    if not raw_code:
+        await message.reply("⚠️ Invalid OTP format. Please send valid numbers.")
+        return
+
+    session_data = ACTIVE_CLIENTS[user_id]
+    client: TelegramClient = session_data["client"]
 
     try:
         await client.sign_in(
-            phone=data["phone_number"],
+            phone=session_data["phone_number"],
             code=raw_code,
-            phone_code_hash=data["phone_code_hash"]
+            phone_code_hash=session_data["phone_code_hash"]
         )
-        
-        # Generate String Session
+
         string_session = client.session.save()
         await client.disconnect()
+        del ACTIVE_CLIENTS[user_id]
         await state.clear()
 
         await message.reply(
@@ -86,12 +112,15 @@ async def process_otp(message: Message, state: FSMContext):
 
     except SessionPasswordNeededError:
         await state.set_state(StringSessionState.waiting_for_2fa)
-        await message.reply("🔐 **2FA Password Required!**\nPlease enter your Two-Step Verification password.")
+        await message.reply("🔐 **2FA Password Required!**\nPlease enter your Two-Step Verification password below.")
 
     except PhoneCodeInvalidError:
-        await message.reply("❌ **Invalid OTP Code.** Please check and try again.")
+        await message.reply("❌ **Invalid OTP Code.** Please double-check and send the code again.")
+
     except Exception as e:
         await client.disconnect()
+        if user_id in ACTIVE_CLIENTS:
+            del ACTIVE_CLIENTS[user_id]
         await state.clear()
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
 
@@ -99,14 +128,22 @@ async def process_otp(message: Message, state: FSMContext):
 # 2FA Password Handler
 @router.message(StringSessionState.waiting_for_2fa)
 async def process_2fa(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    if user_id not in ACTIVE_CLIENTS:
+        await state.clear()
+        await message.reply("❌ Session expired. Please start again with `/string`.")
+        return
+
     password = message.text.strip()
-    data = await state.get_data()
-    client: TelegramClient = data["client"]
+    session_data = ACTIVE_CLIENTS[user_id]
+    client: TelegramClient = session_data["client"]
 
     try:
         await client.sign_in(password=password)
         string_session = client.session.save()
         await client.disconnect()
+        del ACTIVE_CLIENTS[user_id]
         await state.clear()
 
         await message.reply(
@@ -115,5 +152,7 @@ async def process_2fa(message: Message, state: FSMContext):
         )
     except Exception as e:
         await client.disconnect()
+        if user_id in ACTIVE_CLIENTS:
+            del ACTIVE_CLIENTS[user_id]
         await state.clear()
         await message.reply(f"❌ **Error:** `{str(e)}`", parse_mode="Markdown")
