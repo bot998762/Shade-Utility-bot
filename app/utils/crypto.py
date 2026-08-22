@@ -22,7 +22,8 @@ def check_password_strength(password: str) -> str:
     if any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password): score += 1
     
     if score >= 5: return "Very Strong 🔒"
-    elif score >= 3: return "Moderate ⚠️"
+    elif score == 4: return "Strong ✅"
+    elif score == 3: return "Moderate ⚠️"
     return "Weak ❌"
 
 def gen_hashes(text: str) -> tuple:

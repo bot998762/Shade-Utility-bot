@@ -31,7 +31,15 @@ FEATURE_MODULES = [
 ]
 
 
-def load_features(dp: Dispatcher, registry: CapabilityRegistry) -> None:
+def load_features(
+    dp: Dispatcher, registry: CapabilityRegistry
+) -> tuple[list[str], list[str]]:
+    """Load all feature modules in isolation.
+
+    Returns:
+        (loaded_names, failed_module_paths) — callers use this to populate
+        degraded_features in the health readiness state.
+    """
     loaded: list[str] = []
     failed: list[tuple[str, str]] = []
 
@@ -80,3 +88,5 @@ def load_features(dp: Dispatcher, registry: CapabilityRegistry) -> None:
             "event": "degraded_startup",
             "message": f"{len(failed)} feature(s) failed to load; bot running in degraded mode",
         })
+
+    return loaded, [m for m, _ in failed]

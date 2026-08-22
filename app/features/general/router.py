@@ -8,6 +8,10 @@ from aiogram.filters import CommandStart, Command
 from app.platform.capability import FeatureManifest
 from app.keyboards.inline_kb import main_menu_kb, category_dev_kb
 from app.utils import crypto
+from app.utils.network import is_safe_host as _is_safe_host
+from app.core.logger import setup_logger
+
+logger = setup_logger()
 
 manifest = FeatureManifest(name="GeneralTools", version="1.0.0", category="Core")
 router = Router()
@@ -248,18 +252,6 @@ async def cmd_jsonfmt(message: Message) -> None:
         await message.reply(f"❌ **Invalid JSON:** `{exc}`", parse_mode="Markdown")
 
 
-def _is_safe_host(host: str) -> bool:
-    """Basic SSRF guard: reject private/loopback targets."""
-    import ipaddress
-    try:
-        addr = ipaddress.ip_address(host)
-        return not (addr.is_private or addr.is_loopback or addr.is_link_local)
-    except ValueError:
-        # It's a hostname; block obvious internal names
-        lower = host.lower()
-        return not any(lower == h or lower.endswith(f".{h}") for h in (
-            "localhost", "internal", "local", "metadata", "169.254.169.254"
-        ))
 
 
 @router.message(Command("ip"))
@@ -275,14 +267,53 @@ async def cmd_ip(message: Message, bootstrap_ref) -> None:
         return
 
     status = await message.reply("🔍 Executing Network Geo-Lookup...")
+    import aiohttp, json as _json, time as _time
+    session: aiohttp.ClientSession = bootstrap_ref.http_session
+    # ip-api.com: HTTP is the free-tier endpoint; HTTPS requires a paid key.
+    url = f"http://ip-api.com/json/{query}"
+    t0 = _time.monotonic()
     try:
-        import aiohttp
-        session: aiohttp.ClientSession = bootstrap_ref.http_session
-        async with session.get(
-            f"https://ip-api.com/json/{query}",  # HTTPS endpoint
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            data = await resp.json()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            # Read text first — ip-api returns text/html on rate-limit (429)
+            raw = await resp.text(encoding="utf-8", errors="replace")
+            latency_ms = int((_time.monotonic() - t0) * 1000)
+
+            if resp.status == 429:
+                logger.warning({"event": "ip_rate_limited", "query": query, "latency_ms": latency_ms})
+                await status.edit_text(
+                    "⏳ IP lookup service is temporarily rate-limited. Please try again in a moment.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            if resp.status != 200:
+                logger.warning({
+                    "event": "ip_http_error",
+                    "query": query,
+                    "status": resp.status,
+                    "latency_ms": latency_ms,
+                })
+                await status.edit_text(
+                    "❌ IP lookup service is temporarily unavailable.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            try:
+                data = _json.loads(raw)
+            except (_json.JSONDecodeError, ValueError):
+                logger.error({
+                    "event": "ip_non_json",
+                    "query": query,
+                    "body_preview": raw[:150],
+                    "latency_ms": latency_ms,
+                })
+                await status.edit_text(
+                    "❌ Unexpected response from IP lookup service.",
+                    parse_mode="Markdown",
+                )
+                return
+
             if data.get("status") == "success":
                 res_text = (
                     f"🌐 **Network Geo-Lookup Result**\n"
@@ -296,9 +327,23 @@ async def cmd_ip(message: Message, bootstrap_ref) -> None:
                 )
                 await status.edit_text(res_text, parse_mode="Markdown")
             else:
-                await status.edit_text(f"❌ Lookup failed for `{query}`.", parse_mode="Markdown")
+                # ip-api returns {status: "fail", message: "..."} for invalid input
+                fail_msg = data.get("message", "unknown")
+                logger.info({"event": "ip_lookup_failed", "query": query, "reason": fail_msg})
+                await status.edit_text(
+                    f"❌ Could not look up `{query}`: {fail_msg}",
+                    parse_mode="Markdown",
+                )
+
+    except aiohttp.ServerTimeoutError:
+        logger.warning({"event": "ip_timeout", "query": query})
+        await status.edit_text("⏱️ IP lookup timed out. Please try again.", parse_mode="Markdown")
+    except aiohttp.ClientConnectorError as exc:
+        logger.error({"event": "ip_connection_error", "error": type(exc).__name__})
+        await status.edit_text("❌ Cannot reach IP lookup service.", parse_mode="Markdown")
     except Exception as exc:
-        await status.edit_text(f"❌ Network Query Error: `{type(exc).__name__}`", parse_mode="Markdown")
+        logger.error({"event": "ip_unexpected_error", "query": query, "error": type(exc).__name__})
+        await status.edit_text("❌ IP lookup error. Please try again later.", parse_mode="Markdown")
 
 
 @router.message(Command("weather"))
@@ -313,31 +358,99 @@ async def cmd_weather(message: Message, bootstrap_ref) -> None:
         return
 
     status = await message.reply(f"⛅ Fetching weather for **{city}**...", parse_mode="Markdown")
+    import aiohttp, json as _json, time as _time
+    session: aiohttp.ClientSession = bootstrap_ref.http_session
+    # quote_plus encodes spaces as '+' which wttr.in handles better than '%20'
+    from urllib.parse import quote_plus
+    url = f"https://wttr.in/{quote_plus(city)}?format=j1"
+    t0 = _time.monotonic()
     try:
-        import aiohttp
-        session: aiohttp.ClientSession = bootstrap_ref.http_session
         async with session.get(
-            f"https://wttr.in/{quote(city)}?format=j1",
+            url,
+            headers={"Accept": "application/json"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
+            # Always read text first — wttr.in returns text/plain (HTTP 200!)
+            # for unknown cities instead of raising a 4xx status.
+            raw = await resp.text(encoding="utf-8", errors="replace")
+            latency_ms = int((_time.monotonic() - t0) * 1000)
+
             if resp.status != 200:
-                await status.edit_text(f"❌ Location query failed: `{city}`", parse_mode="Markdown")
+                logger.warning({
+                    "event": "weather_http_error",
+                    "city": city,
+                    "status": resp.status,
+                    "latency_ms": latency_ms,
+                })
+                await status.edit_text(
+                    "❌ Weather service is temporarily unavailable. Please try again.",
+                    parse_mode="Markdown",
+                )
                 return
-            data = await resp.json()
-            current = data["current_condition"][0]
-            area = data["nearest_area"][0]
-            res_text = (
-                f"⛅ **Weather: {area['areaName'][0]['value']}, {area['country'][0]['value']}**\n"
-                f"───────────────────────────\n"
-                f"🌡️ **Temperature:** `{current['temp_C']}°C` (Feels `{current['FeelsLikeC']}°C`)\n"
-                f"☁️ **Condition:** {current['weatherDesc'][0]['value']}\n"
-                f"💧 **Humidity:** `{current['humidity']}%`\n"
-                f"💨 **Wind:** `{current['windspeedKmph']} km/h`\n"
-                f"───────────────────────────"
-            )
-            await status.edit_text(res_text, parse_mode="Markdown")
+
+            # Attempt JSON decode — text/plain body means "city not found"
+            try:
+                data = _json.loads(raw)
+            except (_json.JSONDecodeError, ValueError):
+                logger.info({
+                    "event": "weather_city_not_found",
+                    "city": city,
+                    "latency_ms": latency_ms,
+                    "body_preview": raw[:120],
+                })
+                await status.edit_text(
+                    f"❌ Location **{city}** not found.\n"
+                    f"Try a more specific name, e.g. `/weather London, UK`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            # Validate schema before indexing
+            if "current_condition" not in data or "nearest_area" not in data:
+                logger.error({
+                    "event": "weather_unexpected_schema",
+                    "city": city,
+                    "keys": list(data.keys())[:10],
+                })
+                await status.edit_text(
+                    "❌ Unexpected response from weather service.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            try:
+                current = data["current_condition"][0]
+                area = data["nearest_area"][0]
+                res_text = (
+                    f"⛅ **Weather: {area['areaName'][0]['value']}, {area['country'][0]['value']}**\n"
+                    f"───────────────────────────\n"
+                    f"🌡️ **Temperature:** `{current['temp_C']}°C` (Feels `{current['FeelsLikeC']}°C`)\n"
+                    f"☁️ **Condition:** {current['weatherDesc'][0]['value']}\n"
+                    f"💧 **Humidity:** `{current['humidity']}%`\n"
+                    f"💨 **Wind:** `{current['windspeedKmph']} km/h`\n"
+                    f"───────────────────────────"
+                )
+                await status.edit_text(res_text, parse_mode="Markdown")
+            except (KeyError, IndexError, TypeError) as exc:
+                logger.error({
+                    "event": "weather_schema_mismatch",
+                    "city": city,
+                    "error": type(exc).__name__,
+                })
+                await status.edit_text(
+                    "❌ Could not parse weather data. Please try again.",
+                    parse_mode="Markdown",
+                )
+
+    except aiohttp.ServerTimeoutError:
+        logger.warning({"event": "weather_timeout", "city": city})
+        await status.edit_text("⏱️ Weather service timed out. Please try again.", parse_mode="Markdown")
+    except aiohttp.ClientConnectorError as exc:
+        logger.error({"event": "weather_connection_error", "error": type(exc).__name__})
+        await status.edit_text("❌ Cannot reach weather service.", parse_mode="Markdown")
     except Exception as exc:
-        await status.edit_text(f"❌ Weather Error: `{type(exc).__name__}`", parse_mode="Markdown")
+        logger.error({"event": "weather_unexpected_error", "city": city, "error": type(exc).__name__})
+        await status.edit_text("❌ Weather service error. Please try again later.", parse_mode="Markdown")
 
 
 @router.message(Command("id"))
@@ -350,19 +463,39 @@ async def cmd_id(message: Message) -> None:
         text += f"🧵 **Topic Thread ID:** `{message.message_thread_id}`\n"
     if message.reply_to_message:
         replied_user = message.reply_to_message.from_user
-        text += (
-            f"\n📩 **Replied Target:**\n"
-            f"• **User ID:** `{replied_user.id}`\n"
-            f"• **Name:** {replied_user.first_name}\n"
-            f"• **Message ID:** `{message.reply_to_message.message_id}`\n"
-        )
+        if replied_user is None:
+            # Channel posts, anonymous admins, and some service messages have no from_user
+            text += (
+                f"\n📩 **Replied Message:**\n"
+                f"• **Message ID:** `{message.reply_to_message.message_id}`\n"
+                f"• **Sender:** Anonymous / Channel\n"
+            )
+        else:
+            text += (
+                f"\n📩 **Replied Target:**\n"
+                f"• **User ID:** `{replied_user.id}`\n"
+                f"• **Name:** {replied_user.first_name}\n"
+                f"• **Message ID:** `{message.reply_to_message.message_id}`\n"
+            )
     text += "───────────────────────────"
     await message.reply(text, parse_mode="Markdown")
 
 
 @router.message(Command("info"))
 async def cmd_info(message: Message) -> None:
-    target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
+    target = (
+        message.reply_to_message.from_user
+        if message.reply_to_message
+        else message.from_user
+    )
+    # from_user is None for channel posts and anonymous admins
+    if target is None:
+        await message.reply(
+            "❌ Cannot inspect this message type.\n"
+            "It appears to be from a channel or anonymous sender.",
+            parse_mode="Markdown",
+        )
+        return
     username = f"@{target.username}" if target.username else "None"
     is_premium = "Active 🌟" if getattr(target, "is_premium", False) else "Standard"
     info_text = (

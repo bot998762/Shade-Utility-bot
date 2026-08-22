@@ -117,13 +117,10 @@ class ApplicationBootstrap:
             self.dp.callback_query.middleware(PlatformDIMiddleware(self))
 
             # --- Features (isolated; partial failure ok) ---
-            load_features(self.dp, self.capability_registry)
-            features_loaded = len(self.capability_registry.features)
-            degraded = [
-                name
-                for name, f in self.capability_registry.features.items()
-                if not f.enabled
-            ]
+            loaded_names, failed_modules = load_features(self.dp, self.capability_registry)
+            features_loaded = len(loaded_names)
+            # degraded = modules that failed to load (never entered registry)
+            degraded = failed_modules
 
             # --- Polling ---
             await self.bot.delete_webhook(drop_pending_updates=True)
@@ -133,10 +130,10 @@ class ApplicationBootstrap:
             )
             app["bot_task"] = bot_task
 
-            # --- Mark ready ---
+            # --- Mark ready (pass LIVE object references, not boolean snapshots) ---
             set_ready(
-                bot_task_ok=not bot_task.done(),
-                http_session_ok=not self.http_session.closed,
+                bot_task=bot_task,
+                http_session=self.http_session,
                 features_loaded=features_loaded,
                 degraded_features=degraded,
             )

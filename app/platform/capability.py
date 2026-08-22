@@ -7,6 +7,7 @@ class FeatureManifest:
     name: str
     version: str
     category: str
+    description: str = ""
     is_premium: bool = False
     enabled: bool = True
 

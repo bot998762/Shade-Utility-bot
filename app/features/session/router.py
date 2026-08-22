@@ -59,7 +59,9 @@ async def _cleanup_user_session(user_id: int) -> None:
         return
 
     task: asyncio.Task | None = session_data.get("task")
-    if task and not task.done():
+    # Never cancel or await the current task from within itself —
+    # doing so causes a 2-second dead-wait on every QR timeout.
+    if task and not task.done() and task is not asyncio.current_task():
         task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=2.0)

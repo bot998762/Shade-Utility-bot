@@ -11,8 +11,17 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
-    def validate_startup(self):
+    def validate_startup(self) -> None:
         if not self.BOT_TOKEN:
             raise ValueError("BOT_TOKEN is missing!")
+        # Non-fatal warnings — bot starts but affected features will degrade
+        import logging
+        _log = logging.getLogger("ShadePlatform")
+        if not self.OCR_API_KEY:
+            _log.warning({
+                "event": "config_warning",
+                "key": "OCR_API_KEY",
+                "impact": "/ocr command will fail with 401 until key is set",
+            })
 
 settings = Settings()
