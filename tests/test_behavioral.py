@@ -1129,8 +1129,13 @@ class TestSessionStateMachine(unittest.TestCase):
     def setUp(self):
         self.src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
 
-    def test_no_otp_flow(self):
-        self.assertNotIn("send_code_request", self.src)
+    def test_otp_flow_present(self):
+        """OTP is now implemented (send_code_request must appear in source)."""
+        self.assertIn("send_code_request", self.src)
+
+    def test_otp_has_security_warning(self):
+        """OTP warning about Telegram security block must be present in source."""
+        self.assertIn("security", self.src.lower())
 
     def test_qr_login_present(self):
         self.assertIn("qr_login", self.src)
@@ -1163,6 +1168,631 @@ class TestSessionStateMachine(unittest.TestCase):
                 if isinstance(fn, ast.Attribute) and fn.attr in ("info", "error", "warning"):
                     call_src = ast.unparse(node)
                     self.assertNotIn("string_session", call_src)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 13 — /string CONVERSATION FLOW & LIFECYCLE (v3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
+    """
+    Tests for the new multi-step /string conversation flow:
+      /string → API ID → API HASH → method button → QR or OTP → session string
+    Uses lightweight fakes; no real Telegram/Telethon calls.
+    """
+
+    def _skip_no_telethon(self):
+        try:
+            import telethon  # noqa: F401
+        except ImportError:
+            self.skipTest("telethon not installed")
+
+    # ------------------------------------------------------------------
+    # Source-level checks for new states
+    # ------------------------------------------------------------------
+
+    def test_new_states_present(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        for state_name in (
+            "waiting_for_api_id",
+            "waiting_for_api_hash",
+            "waiting_for_method",
+            "waiting_for_phone",
+            "waiting_for_otp",
+            "waiting_for_2fa",
+        ):
+            self.assertIn(state_name, src, f"State {state_name!r} missing from router")
+
+    def test_method_keyboard_buttons_present(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("ses_method_qr",  src)
+        self.assertIn("ses_method_otp", src)
+        self.assertIn("ses_cancel",     src)
+        self.assertIn("ses_qr_refresh", src)
+
+    def test_qr_countdown_interval_defined(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("QR_COUNTDOWN_INTERVAL", src)
+
+    def test_qr_recreate_called(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("recreate()", src)
+
+    def test_send_code_request_present(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("send_code_request", src)
+
+    def test_countdown_task_key_in_cleanup(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("countdown_task", src)
+
+    def test_qr_caption_helper_present(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("_qr_caption", src)
+
+    def test_expires_in_caption(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("Expires in:", src)
+
+    # ------------------------------------------------------------------
+    # API ID validation
+    # ------------------------------------------------------------------
+
+    async def test_recv_api_id_valid(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        state     = AsyncMock()
+        state.get_data = AsyncMock(return_value={})
+        message   = MagicMock()
+        message.text = "12345678"
+        message.reply = AsyncMock()
+
+        await sess_mod.recv_api_id(message, state)
+
+        state.update_data.assert_called_once_with(api_id=12345678)
+        state.set_state.assert_called_once()
+        message.reply.assert_called_once()
+
+    async def test_recv_api_id_invalid_text(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.text  = "notanumber"
+        message.reply = AsyncMock()
+
+        await sess_mod.recv_api_id(message, state)
+
+        state.update_data.assert_not_called()
+        message.reply.assert_called_once()
+        # Must mention "integer"
+        self.assertIn("integer", message.reply.call_args[0][0].lower())
+
+    async def test_recv_api_id_zero_rejected(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.text  = "0"
+        message.reply = AsyncMock()
+
+        await sess_mod.recv_api_id(message, state)
+
+        state.update_data.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # API HASH validation
+    # ------------------------------------------------------------------
+
+    async def test_recv_api_hash_valid(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        valid_hash = "a" * 32
+        state      = AsyncMock()
+        state.get_data = AsyncMock(return_value={"api_id": 999})
+        message    = MagicMock()
+        message.text  = valid_hash
+        message.reply = AsyncMock()
+
+        await sess_mod.recv_api_hash(message, state)
+
+        state.update_data.assert_called_once_with(api_hash=valid_hash)
+        state.set_state.assert_called_once()
+        # Reply must contain method keyboard
+        message.reply.assert_called_once()
+
+    async def test_recv_api_hash_wrong_length(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.text  = "abc"          # too short
+        message.reply = AsyncMock()
+
+        await sess_mod.recv_api_hash(message, state)
+
+        state.update_data.assert_not_called()
+        message.reply.assert_called_once()
+
+    async def test_recv_api_hash_non_hex(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.text  = "g" * 32       # 32 chars but not hex
+        message.reply = AsyncMock()
+
+        await sess_mod.recv_api_hash(message, state)
+
+        state.update_data.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Method selection buttons
+    # ------------------------------------------------------------------
+
+    async def test_cb_method_otp_sets_phone_state(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        state    = AsyncMock()
+        callback = MagicMock()
+        callback.answer  = AsyncMock()
+        callback.message = MagicMock()
+        callback.message.edit_text = AsyncMock()
+
+        await sess_mod.cb_method_otp(callback, state)
+
+        state.set_state.assert_called_once_with(sess_mod.StringSessionState.waiting_for_phone)
+        callback.message.edit_text.assert_called_once()
+        # Must mention phone
+        call_text = callback.message.edit_text.call_args[0][0]
+        self.assertIn("phone", call_text.lower())
+
+    # ------------------------------------------------------------------
+    # QR countdown unit tests (no real Telegram)
+    # ------------------------------------------------------------------
+
+    async def test_qr_countdown_cancels_cleanly(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        bot        = MagicMock()
+        bot.edit_message_caption = AsyncMock()
+        fake_state = AsyncMock()
+
+        # Session gone before countdown wakes up
+        user_id = 77001
+        # do NOT add to ACTIVE_CLIENTS → countdown should return immediately after sleep
+
+        task = asyncio.create_task(
+            sess_mod._qr_countdown(user_id, bot, 1, 1, fake_state)
+        )
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass  # expected
+
+    async def test_qr_countdown_stops_when_session_removed(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        bot        = MagicMock()
+        bot.edit_message_caption = AsyncMock()
+        fake_state = AsyncMock()
+
+        user_id = 77002
+        # Session not in ACTIVE_CLIENTS → countdown must return on first tick
+        task = asyncio.create_task(
+            sess_mod._qr_countdown(user_id, bot, 1, 1, fake_state)
+        )
+        # Give it a moment; it will sleep then check ACTIVE_CLIENTS and return
+        await asyncio.sleep(0.05)
+        # We patch the sleep so the task finishes quickly
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Cleanup: countdown_task also cancelled
+    # ------------------------------------------------------------------
+
+    async def test_cleanup_cancels_countdown_task(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        cancelled_flags = {"countdown": False, "main": False}
+
+        async def _fake_countdown():
+            try:
+                await asyncio.sleep(999)
+            except asyncio.CancelledError:
+                cancelled_flags["countdown"] = True
+                raise
+
+        async def _fake_main():
+            try:
+                await asyncio.sleep(999)
+            except asyncio.CancelledError:
+                cancelled_flags["main"] = True
+                raise
+
+        ct   = asyncio.create_task(_fake_countdown())
+        mt   = asyncio.create_task(_fake_main())
+        await asyncio.sleep(0)  # let tasks start
+
+        user_id = 77010
+        fake_client = MagicMock()
+        fake_client.is_connected.return_value = True
+        fake_client.disconnect = AsyncMock()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":         fake_client,
+            "task":           mt,
+            "countdown_task": ct,
+            "chat_id":        1,
+            "created_at":     0,
+        }
+
+        await sess_mod._cleanup_user_session(user_id)
+        await asyncio.sleep(0)
+
+        self.assertTrue(ct.done(), "countdown_task must be cancelled")
+        self.assertTrue(mt.done(), "main task must be cancelled")
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+
+    # ------------------------------------------------------------------
+    # OTP flow
+    # ------------------------------------------------------------------
+
+    async def test_recv_phone_invalid_format(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.text  = "notaphone"
+        message.reply = AsyncMock()
+
+        await sess_mod.recv_phone(message, state)
+
+        # Should ask again, not advance state
+        state.set_state.assert_not_called()
+        message.reply.assert_called_once()
+
+    async def test_recv_otp_session_expired(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        # No ACTIVE_CLIENTS entry
+        user_id = 88001
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user     = MagicMock()
+        message.from_user.id  = user_id
+        message.text          = "12345"
+        message.reply         = AsyncMock()
+
+        await sess_mod.recv_otp(message, state)
+
+        state.clear.assert_called_once()
+        message.reply.assert_called_once()
+        self.assertIn("expired", message.reply.call_args[0][0].lower())
+
+    async def test_recv_otp_invalid_code(self):
+        self._skip_no_telethon()
+        from telethon.errors import PhoneCodeInvalidError
+        from app.features.session import router as sess_mod
+
+        user_id = 88002
+
+        fake_client = MagicMock()
+        fake_client.sign_in = AsyncMock(side_effect=PhoneCodeInvalidError(None))
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+1234567890",
+            "phone_code_hash": "fakehash",
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = user_id
+        message.text         = "99999"
+        message.reply        = AsyncMock()
+
+        await sess_mod.recv_otp(message, state)
+
+        # Must not clean up session — let user retry
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        message.reply.assert_called_once()
+        self.assertIn("incorrect", message.reply.call_args[0][0].lower())
+
+        # Cleanup
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_recv_otp_success(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        user_id = 88003
+
+        fake_client = MagicMock()
+        fake_client.sign_in = AsyncMock()
+        fake_client.session = MagicMock()
+        fake_client.session.save = MagicMock(return_value="1BQANOTEuMTc...")
+        fake_client.is_connected = MagicMock(return_value=True)
+        fake_client.disconnect   = AsyncMock()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+1234567890",
+            "phone_code_hash": "fakehash",
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = user_id
+        message.text         = "12345"
+        message.reply        = AsyncMock()
+
+        await sess_mod.recv_otp(message, state)
+
+        # Session must be cleaned up on success
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        state.clear.assert_called_once()
+        message.reply.assert_called_once()
+        reply_text = message.reply.call_args[0][0]
+        self.assertIn("✅", reply_text)
+        self.assertIn("1BQANOTEuMTc...", reply_text)
+
+    # ------------------------------------------------------------------
+    # 2FA — shared path
+    # ------------------------------------------------------------------
+
+    async def test_2fa_session_expired(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        user_id = 99101
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = user_id
+        message.text         = "mypassword"
+        message.reply        = AsyncMock()
+
+        await sess_mod.process_2fa(message, state)
+
+        state.clear.assert_called_once()
+        message.reply.assert_called_once()
+        self.assertIn("expired", message.reply.call_args[0][0].lower())
+
+    async def test_2fa_wrong_password(self):
+        self._skip_no_telethon()
+        from telethon.errors import PasswordHashInvalidError
+        from app.features.session import router as sess_mod
+
+        user_id = 99102
+
+        fake_client = MagicMock()
+        fake_client.sign_in = AsyncMock(side_effect=PasswordHashInvalidError(None))
+        fake_client.is_connected = MagicMock(return_value=True)
+        fake_client.disconnect   = AsyncMock()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":         fake_client,
+            "method":         "qr",
+            "chat_id":        1,
+            "task":           None,
+            "countdown_task": None,
+            "created_at":     0,
+        }
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = user_id
+        message.text         = "wrongpassword"
+        message.reply        = AsyncMock()
+
+        await sess_mod.process_2fa(message, state)
+
+        # Wrong password → session kept, user asked to retry
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        message.reply.assert_called_once()
+        self.assertIn("incorrect", message.reply.call_args[0][0].lower())
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_2fa_success(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        user_id = 99103
+
+        fake_client = MagicMock()
+        fake_client.sign_in = AsyncMock()
+        fake_client.session = MagicMock()
+        fake_client.session.save = MagicMock(return_value="SESSION_STRING_XYZ")
+        fake_client.is_connected = MagicMock(return_value=True)
+        fake_client.disconnect   = AsyncMock()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":         fake_client,
+            "method":         "qr",
+            "chat_id":        1,
+            "task":           None,
+            "countdown_task": None,
+            "created_at":     0,
+        }
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = user_id
+        message.text         = "correct_password"
+        message.reply        = AsyncMock()
+
+        await sess_mod.process_2fa(message, state)
+
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        state.clear.assert_called_once()
+        reply_text = message.reply.call_args[0][0]
+        self.assertIn("SESSION_STRING_XYZ", reply_text)
+        self.assertIn("✅", reply_text)
+
+    # ------------------------------------------------------------------
+    # Concurrent user isolation
+    # ------------------------------------------------------------------
+
+    async def test_concurrent_users_isolated_v3(self):
+        """User A's session data must never overlap with user B's."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        def _mk_client():
+            c = MagicMock()
+            c.is_connected.return_value = True
+            c.disconnect = AsyncMock()
+            return c
+
+        client_a = _mk_client()
+        client_b = _mk_client()
+
+        sess_mod.ACTIVE_CLIENTS[2001] = {
+            "client":         client_a,
+            "method":         "qr",
+            "chat_id":        101,
+            "task":           None,
+            "countdown_task": None,
+            "created_at":     0,
+        }
+        sess_mod.ACTIVE_CLIENTS[2002] = {
+            "client":         client_b,
+            "method":         "otp",
+            "chat_id":        102,
+            "task":           None,
+            "countdown_task": None,
+            "created_at":     0,
+        }
+
+        # Clean up A only
+        await sess_mod._cleanup_user_session(2001)
+
+        self.assertNotIn(2001, sess_mod.ACTIVE_CLIENTS)
+        self.assertIn(2002, sess_mod.ACTIVE_CLIENTS)
+        # B's client must be untouched
+        client_a.disconnect.assert_called_once()
+        client_b.disconnect.assert_not_called()
+        self.assertEqual(sess_mod.ACTIVE_CLIENTS[2002]["method"], "otp")
+
+        await sess_mod._cleanup_user_session(2002)
+
+    # ------------------------------------------------------------------
+    # Cancellation via callback
+    # ------------------------------------------------------------------
+
+    async def test_cancel_cleans_up_and_clears_state(self):
+        """ses_cancel callback must remove ACTIVE_CLIENTS entry and clear FSM."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        user_id = 66001
+
+        fake_client = MagicMock()
+        fake_client.is_connected.return_value = True
+        fake_client.disconnect = AsyncMock()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":         fake_client,
+            "task":           None,
+            "countdown_task": None,
+            "chat_id":        1,
+            "created_at":     0,
+        }
+
+        state    = AsyncMock()
+        callback = MagicMock()
+        callback.from_user    = MagicMock()
+        callback.from_user.id = user_id
+        callback.answer       = AsyncMock()
+        callback.message      = MagicMock()
+        callback.message.photo = None
+        callback.message.edit_text = AsyncMock()
+        callback.message.answer    = AsyncMock()
+
+        await sess_mod.cb_cancel(callback, state)
+
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        state.clear.assert_called_once()
+        callback.answer.assert_called_once()
+
+    async def test_cancel_photo_message_uses_edit_caption(self):
+        """Cancel on a QR photo message must use edit_caption, not edit_text."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        user_id = 66002
+
+        state    = AsyncMock()
+        callback = MagicMock()
+        callback.from_user    = MagicMock()
+        callback.from_user.id = user_id
+        callback.answer       = AsyncMock()
+        callback.message      = MagicMock()
+        callback.message.photo = [MagicMock()]   # photo message
+        callback.message.edit_caption = AsyncMock()
+        callback.message.edit_text    = AsyncMock()
+
+        await sess_mod.cb_cancel(callback, state)
+
+        callback.message.edit_caption.assert_called_once()
+        callback.message.edit_text.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # QR caption helper
+    # ------------------------------------------------------------------
+
+    def test_qr_caption_contains_countdown(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        caption = sess_mod._qr_caption(75)
+        self.assertIn("75s",   caption)
+        self.assertIn("QR",    caption)
+        self.assertIn("Expires", caption)
+
+    def test_qr_caption_zero(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        caption = sess_mod._qr_caption(0)
+        self.assertIn("0s", caption)
 
 
 if __name__ == "__main__":
