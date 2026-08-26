@@ -414,11 +414,34 @@ def _stop_countdown(user_id: int, session_data: dict) -> None:
 
 @router.message(Command("string"))
 async def cmd_string(message: Message, state: FSMContext) -> None:
-    """Clean up any prior attempt, then show the method-selection keyboard."""
+    """
+    Validate application credentials first, then show the method-selection keyboard.
+
+    Failing here — before any UI is shown — gives the user one clear error
+    instead of a mid-flow failure after they have already chosen a method and
+    entered their phone number.
+    """
     user_id = message.from_user.id
     if user_id in ACTIVE_CLIENTS:
         await _cleanup_user_session(user_id)
     await state.clear()
+
+    # ── Credential pre-flight ─────────────────────────────────────────────
+    # Verify API_ID / API_HASH are configured BEFORE showing any UI.
+    # One clear error here is far better than a mid-flow failure.
+    try:
+        _get_app_credentials()
+    except ValueError as exc:
+        await message.reply(
+            "❌ **Bot configuration error**\n\n"
+            f"`{exc}`\n\n"
+            "The bot administrator must set `API_ID` and `API_HASH` in the "
+            "application environment before `/string` can be used.",
+            parse_mode="Markdown",
+        )
+        return
+    # ─────────────────────────────────────────────────────────────────────
+
     await state.set_state(StringSessionState.waiting_for_method)
     await message.reply(
         "🔐 **Choose Login Method**\n"

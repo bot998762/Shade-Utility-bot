@@ -1245,9 +1245,10 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------
 
     async def test_cmd_string_shows_method_selection(self):
-        """/string must immediately show the method-selection keyboard."""
+        """/string shows the method-selection keyboard when credentials are configured."""
         self._skip_no_telethon()
         from app.features.session import router as sess_mod
+        from unittest.mock import patch
 
         state   = AsyncMock()
         message = MagicMock()
@@ -1255,14 +1256,67 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
         message.from_user.id = 55000
         message.reply        = AsyncMock()
 
-        await sess_mod.cmd_string(message, state)
+        # Credentials are configured → method selection must appear
+        with patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+            await sess_mod.cmd_string(message, state)
 
         state.set_state.assert_called_once_with(sess_mod.StringSessionState.waiting_for_method)
         message.reply.assert_called_once()
-        # The reply must contain neither "API ID" nor "API HASH" — those are internal
+        # The reply must never ask the user for API_ID or API_HASH
         reply_text = message.reply.call_args[0][0]
         self.assertNotIn("API ID",   reply_text)
         self.assertNotIn("API HASH", reply_text)
+
+    async def test_cmd_string_fails_fast_when_credentials_missing(self):
+        """
+        /string must show ONE clear error and stop immediately when API_ID
+        or API_HASH are not configured — not show the UI and fail mid-flow.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = 55001
+        message.reply        = AsyncMock()
+
+        with patch("app.features.session.router._get_app_credentials",
+                   side_effect=ValueError("API_ID is not set in the application environment")):
+            await sess_mod.cmd_string(message, state)
+
+        # Must reply with the error — exactly once
+        message.reply.assert_called_once()
+        reply_text = message.reply.call_args[0][0]
+        self.assertIn("configuration error", reply_text.lower())
+        self.assertIn("API_ID", reply_text)
+
+        # Must NOT advance into the method-selection state
+        state.set_state.assert_not_called()
+
+    async def test_cmd_string_fails_fast_when_api_hash_missing(self):
+        """
+        /string fails fast if API_HASH is missing even when API_ID is set.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch
+
+        state   = AsyncMock()
+        message = MagicMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = 55002
+        message.reply        = AsyncMock()
+
+        with patch("app.features.session.router._get_app_credentials",
+                   side_effect=ValueError("API_HASH is not set in the application environment")):
+            await sess_mod.cmd_string(message, state)
+
+        message.reply.assert_called_once()
+        state.set_state.assert_not_called()
+
 
     def test_configured_credentials_in_source(self):
         """Router must use _get_app_credentials(), not ask user for API_ID/HASH."""
