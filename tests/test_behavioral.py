@@ -1194,14 +1194,16 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
     def test_new_states_present(self):
         src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
         for state_name in (
-            "waiting_for_api_id",
-            "waiting_for_api_hash",
             "waiting_for_method",
             "waiting_for_phone",
             "waiting_for_otp",
             "waiting_for_2fa",
         ):
             self.assertIn(state_name, src, f"State {state_name!r} missing from router")
+        # API-credential states are gone — /string uses configured credentials
+        for removed_state in ("waiting_for_api_id", "waiting_for_api_hash"):
+            self.assertNotIn(removed_state, src,
+                             f"Removed state {removed_state!r} must not reappear")
 
     def test_method_keyboard_buttons_present(self):
         src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
@@ -1238,99 +1240,332 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
     # API ID validation
     # ------------------------------------------------------------------
 
-    async def test_recv_api_id_valid(self):
-        self._skip_no_telethon()
-        from app.features.session import router as sess_mod
-
-        state     = AsyncMock()
-        state.get_data = AsyncMock(return_value={})
-        message   = MagicMock()
-        message.text = "12345678"
-        message.reply = AsyncMock()
-
-        await sess_mod.recv_api_id(message, state)
-
-        state.update_data.assert_called_once_with(api_id=12345678)
-        state.set_state.assert_called_once()
-        message.reply.assert_called_once()
-
-    async def test_recv_api_id_invalid_text(self):
-        self._skip_no_telethon()
-        from app.features.session import router as sess_mod
-
-        state   = AsyncMock()
-        message = MagicMock()
-        message.text  = "notanumber"
-        message.reply = AsyncMock()
-
-        await sess_mod.recv_api_id(message, state)
-
-        state.update_data.assert_not_called()
-        message.reply.assert_called_once()
-        # Must mention "integer"
-        self.assertIn("integer", message.reply.call_args[0][0].lower())
-
-    async def test_recv_api_id_zero_rejected(self):
-        self._skip_no_telethon()
-        from app.features.session import router as sess_mod
-
-        state   = AsyncMock()
-        message = MagicMock()
-        message.text  = "0"
-        message.reply = AsyncMock()
-
-        await sess_mod.recv_api_id(message, state)
-
-        state.update_data.assert_not_called()
-
     # ------------------------------------------------------------------
-    # API HASH validation
+    # /string — immediate method selection (no credentials asked)
     # ------------------------------------------------------------------
 
-    async def test_recv_api_hash_valid(self):
-        self._skip_no_telethon()
-        from app.features.session import router as sess_mod
-
-        valid_hash = "a" * 32
-        state      = AsyncMock()
-        state.get_data = AsyncMock(return_value={"api_id": 999})
-        message    = MagicMock()
-        message.text  = valid_hash
-        message.reply = AsyncMock()
-
-        await sess_mod.recv_api_hash(message, state)
-
-        state.update_data.assert_called_once_with(api_hash=valid_hash)
-        state.set_state.assert_called_once()
-        # Reply must contain method keyboard
-        message.reply.assert_called_once()
-
-    async def test_recv_api_hash_wrong_length(self):
+    async def test_cmd_string_shows_method_selection(self):
+        """/string must immediately show the method-selection keyboard."""
         self._skip_no_telethon()
         from app.features.session import router as sess_mod
 
         state   = AsyncMock()
         message = MagicMock()
-        message.text  = "abc"          # too short
-        message.reply = AsyncMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = 55000
+        message.reply        = AsyncMock()
 
-        await sess_mod.recv_api_hash(message, state)
+        await sess_mod.cmd_string(message, state)
 
-        state.update_data.assert_not_called()
+        state.set_state.assert_called_once_with(sess_mod.StringSessionState.waiting_for_method)
         message.reply.assert_called_once()
+        # The reply must contain neither "API ID" nor "API HASH" — those are internal
+        reply_text = message.reply.call_args[0][0]
+        self.assertNotIn("API ID",   reply_text)
+        self.assertNotIn("API HASH", reply_text)
 
-    async def test_recv_api_hash_non_hex(self):
+    def test_configured_credentials_in_source(self):
+        """Router must use _get_app_credentials(), not ask user for API_ID/HASH."""
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("_get_app_credentials", src)
+        self.assertIn("API_ID",               src)
+        self.assertIn("API_HASH",             src)
+
+    def test_telegram_app_delivery_helper_in_source(self):
+        """Router must declare _is_telegram_app_delivery for delivery-type gate."""
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("_is_telegram_app_delivery", src)
+        self.assertIn("SentCodeTypeApp",           src)
+
+    def test_switch_to_qr_keyboard_in_source(self):
+        """ses_start_qr callback must exist for the 'Use QR Login' button."""
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("ses_start_qr",    src)
+        self.assertIn("_switch_to_qr_kb", src)
+
+    def test_phone_code_expired_handled(self):
+        """PhoneCodeExpiredError must be caught and mapped to a friendly message."""
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("PhoneCodeExpiredError", src)
+        # The handler must recommend QR
+        self.assertIn("QR", src)
+
+    # ------------------------------------------------------------------
+    # _get_app_credentials helper
+    # ------------------------------------------------------------------
+
+    def test_get_app_credentials_missing_api_id(self):
+        self._skip_no_telethon()
+        import os
+        from app.features.session import router as sess_mod
+
+        env_backup = os.environ.copy()
+        os.environ.pop("API_ID",   None)
+        os.environ.pop("API_HASH", None)
+        try:
+            with self.assertRaises(ValueError):
+                sess_mod._get_app_credentials()
+        finally:
+            os.environ.update(env_backup)
+
+    def test_get_app_credentials_missing_api_hash(self):
+        self._skip_no_telethon()
+        import os
+        from app.features.session import router as sess_mod
+
+        env_backup = os.environ.copy()
+        os.environ["API_ID"]  = "12345"
+        os.environ.pop("API_HASH", None)
+        try:
+            with self.assertRaises(ValueError):
+                sess_mod._get_app_credentials()
+        finally:
+            os.environ.update(env_backup)
+
+    def test_get_app_credentials_valid(self):
+        self._skip_no_telethon()
+        import os
+        from app.features.session import router as sess_mod
+
+        env_backup = os.environ.copy()
+        os.environ["API_ID"]   = "99887766"
+        os.environ["API_HASH"] = "abc123"
+        try:
+            api_id, api_hash = sess_mod._get_app_credentials()
+            self.assertEqual(api_id,   99887766)
+            self.assertEqual(api_hash, "abc123")
+        finally:
+            os.environ.update(env_backup)
+
+    # ------------------------------------------------------------------
+    # _is_telegram_app_delivery helper
+    # ------------------------------------------------------------------
+
+    def test_is_telegram_app_delivery_true(self):
+        """Returns True when result.type is SentCodeTypeApp."""
         self._skip_no_telethon()
         from app.features.session import router as sess_mod
 
+        if sess_mod._SENT_CODE_TYPE_APP is None:
+            self.skipTest("SentCodeTypeApp not importable in this Telethon build")
+
+        fake_result = MagicMock()
+        fake_result.type = sess_mod._SENT_CODE_TYPE_APP()
+        self.assertTrue(sess_mod._is_telegram_app_delivery(fake_result))
+
+    def test_is_telegram_app_delivery_false_for_sms(self):
+        """Returns False for any non-App delivery type."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        fake_result = MagicMock()
+        fake_result.type = MagicMock()   # not SentCodeTypeApp
+        # Only returns True for the exact SentCodeTypeApp class
+        self.assertFalse(sess_mod._is_telegram_app_delivery(fake_result))
+
+    def test_is_telegram_app_delivery_none_sentinel(self):
+        """When _SENT_CODE_TYPE_APP is None (import failed), returns False."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch
+
+        with patch.object(sess_mod, "_SENT_CODE_TYPE_APP", None):
+            fake_result = MagicMock()
+            self.assertFalse(sess_mod._is_telegram_app_delivery(fake_result))
+
+    # ------------------------------------------------------------------
+    # recv_phone: Telegram-app delivery detection
+    # ------------------------------------------------------------------
+
+    async def test_recv_phone_telegram_app_delivery_redirects_to_qr(self):
+        """
+        When send_code_request returns SentCodeTypeApp, recv_phone must
+        NOT set waiting_for_otp state, must disconnect the temp client,
+        and must show the 'Use QR Login' button.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM
+
+        fake_client = MagicMock()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_result  = MagicMock()
+
+        user_id = 70001
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client), \
+             patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")), \
+             patch("app.features.session.router._is_telegram_app_delivery",
+                   return_value=True):
+
+            fake_client.send_code_request = AM(return_value=fake_result)
+
+            state   = AsyncMock()
+            message = MagicMock()
+            message.from_user    = MagicMock()
+            message.from_user.id = user_id
+            message.chat         = MagicMock()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        # Must NOT proceed to OTP
+        for call in state.set_state.call_args_list:
+            self.assertNotEqual(
+                call.args[0] if call.args else None,
+                sess_mod.StringSessionState.waiting_for_otp,
+                "waiting_for_otp must not be set when code is Telegram-app delivered",
+            )
+        # Must clear state and disconnect client
+        state.clear.assert_called()
+        fake_client.disconnect.assert_called()
+        # Must NOT create ACTIVE_CLIENTS entry
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        # Must show QR redirect (message contains "ses_start_qr" via keyboard)
+        message.reply.assert_called_once()
+        call_kwargs = message.reply.call_args[1]
+        # The reply_markup must contain ses_start_qr button
+        markup = call_kwargs.get("reply_markup")
+        self.assertIsNotNone(markup)
+        buttons_flat = [btn.callback_data
+                        for row in markup.inline_keyboard for btn in row]
+        self.assertIn("ses_start_qr", buttons_flat)
+
+    async def test_recv_phone_usable_delivery_proceeds_to_otp(self):
+        """
+        When send_code_request returns a non-App type, recv_phone must
+        set waiting_for_otp and create an ACTIVE_CLIENTS entry.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM
+
+        fake_result = MagicMock()
+        fake_result.phone_code_hash = "fakehash123"
+        fake_client = MagicMock()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(return_value=fake_result)
+
+        user_id = 70002
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client), \
+             patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")), \
+             patch("app.features.session.router._is_telegram_app_delivery",
+                   return_value=False):
+
+            state   = AsyncMock()
+            message = MagicMock()
+            message.from_user    = MagicMock()
+            message.from_user.id = user_id
+            message.chat         = MagicMock()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        state.set_state.assert_called_with(sess_mod.StringSessionState.waiting_for_otp)
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    # ------------------------------------------------------------------
+    # recv_otp: PhoneCodeExpiredError mapping
+    # ------------------------------------------------------------------
+
+    async def test_recv_otp_phone_code_expired_friendly_message(self):
+        """
+        PhoneCodeExpiredError must produce a user-friendly explanation that
+        mentions the Telegram security restriction and recommends QR login.
+        It must NOT show a raw exception name to the user.
+        """
+        self._skip_no_telethon()
+        from telethon.errors import PhoneCodeExpiredError
+        from app.features.session import router as sess_mod
+
+        user_id = 71001
+
+        fake_client = MagicMock()
+        fake_client.sign_in = AsyncMock(
+            side_effect=PhoneCodeExpiredError(None)
+        )
+        fake_client.is_connected = MagicMock(return_value=True)
+        fake_client.disconnect   = AsyncMock()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "fakehash",
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
         state   = AsyncMock()
         message = MagicMock()
-        message.text  = "g" * 32       # 32 chars but not hex
-        message.reply = AsyncMock()
+        message.from_user    = MagicMock()
+        message.from_user.id = user_id
+        message.text         = "12345"
+        message.reply        = AsyncMock()
 
-        await sess_mod.recv_api_hash(message, state)
+        await sess_mod.recv_otp(message, state)
 
-        state.update_data.assert_not_called()
+        # Session must be cleaned up
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        state.clear.assert_called_once()
+
+        reply_text = message.reply.call_args[0][0]
+        # Must NOT expose the raw exception class name
+        self.assertNotIn("PhoneCodeExpiredError", reply_text)
+        # Must mention QR as alternative
+        self.assertIn("QR", reply_text)
+
+    # ------------------------------------------------------------------
+    # ses_start_qr callback
+    # ------------------------------------------------------------------
+
+    async def test_cb_start_qr_triggers_qr_flow(self):
+        """ses_start_qr callback must call _start_qr_login with configured creds."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM
+
+        user_id = 72001
+
+        with patch("app.features.session.router._get_app_credentials",
+                   return_value=(99, "zz")), \
+             patch("app.features.session.router._start_qr_login", new=AM()) as mock_start:
+
+            state    = AsyncMock()
+            callback = MagicMock()
+            callback.from_user    = MagicMock()
+            callback.from_user.id = user_id
+            callback.answer       = AM()
+            callback.message      = MagicMock()
+            callback.message.chat = MagicMock()
+            callback.message.chat.id = 1
+            callback.message.edit_text = AM()
+            bot = MagicMock()
+
+            await sess_mod.cb_start_qr(callback, state, bot)
+
+        mock_start.assert_called_once()
+        call_kwargs = mock_start.call_args
+        # Must pass the configured api_id and api_hash
+        args = call_kwargs.args
+        self.assertEqual(args[2], 99)    # api_id
+        self.assertEqual(args[3], "zz")  # api_hash
 
     # ------------------------------------------------------------------
     # Method selection buttons

@@ -1,33 +1,36 @@
 """
 Session Feature — Telegram String Session Generator
 ====================================================
-Supports two login methods selectable after API credentials are entered:
+Uses the application's own API_ID / API_HASH (from environment).
+Users never supply credentials — they only authenticate their Telegram account.
 
-  1. QR Login (recommended) — out-of-band scan; avoids Telegram's
-     "code previously shared by your account" security block entirely.
-  2. OTP Login — phone number + verification code received via SMS or
-     push notification on a DIFFERENT device.  Works when the user
-     receives the code via SMS; may fail if Telegram routes the code
-     through the same Telegram session (security block).  QR is the
-     safer default.
+Login methods:
+  1. QR Login (recommended) — out-of-band scan; completely avoids Telegram's
+     "code previously shared by your account" security restriction.
+  2. OTP Login — phone number + verification code. Works ONLY when Telegram
+     routes the code via SMS or a phone call (SentCodeTypeSms / Call / etc.).
+     If Telegram routes the code through the Telegram app itself
+     (SentCodeTypeApp), the code CANNOT be re-entered here — Telegram will
+     reject it. The bot detects this upfront and redirects to QR login.
 
 State machine:
   IDLE
-  └─(cmd_string)──► WAITING_API_ID
-                    └─(api_id ok)──► WAITING_API_HASH
-                                     └─(api_hash ok)──► WAITING_METHOD
-                                                        ├─(QR button)──► [bg tasks] ──► AUTHENTICATED
-                                                        │                            └─► WAITING_FOR_2FA ──► AUTHENTICATED
-                                                        └─(OTP button)──► WAITING_PHONE ──► WAITING_OTP
-                                                                                            ├─► AUTHENTICATED
-                                                                                            └─► WAITING_FOR_2FA ──► AUTHENTICATED
-  Any state ──(Cancel button)──► IDLE
+  └─(/string)──► WAITING_METHOD
+                 ├─(ses_method_qr / ses_start_qr)──► [bg tasks]──► AUTHENTICATED
+                 │                                              └──► WAITING_2FA ──► AUTHENTICATED
+                 ├─(ses_method_otp)──► WAITING_PHONE
+                 │      └─(phone ok, type=App)──► IDLE (show ses_start_qr button)
+                 │      └─(phone ok, type=usable)──► WAITING_OTP
+                 │                   ├─► AUTHENTICATED
+                 │                   └─► WAITING_2FA ──► AUTHENTICATED
+                 └─(ses_cancel anywhere)──► IDLE
 """
 
-import io
+import os
 import time
 import asyncio
 from datetime import datetime, timezone
+
 from aiogram import Router, Bot, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -47,6 +50,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
     PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
     PasswordHashInvalidError,
 )
 
@@ -54,10 +58,20 @@ from app.platform.capability import FeatureManifest
 from app.utils.qr import generate_qr_buffer
 from app.core.logger import setup_logger
 
+# ---------------------------------------------------------------------------
+# Attempt to import SentCodeTypeApp for delivery-type detection.
+# If the import fails (e.g. older Telethon build), we fall through safely.
+# ---------------------------------------------------------------------------
+try:
+    from telethon.tl.types import auth as _tl_auth_types
+    _SENT_CODE_TYPE_APP = _tl_auth_types.SentCodeTypeApp
+except (ImportError, AttributeError):
+    _SENT_CODE_TYPE_APP = None
+
 manifest = FeatureManifest(
     name="session",
     description="Telegram String Session Generator via QR or OTP Login",
-    version="3.0.0",
+    version="4.0.0",
     category="Auth",
 )
 
@@ -78,23 +92,54 @@ ACTIVE_CLIENTS: dict[int, dict] = {}
 # ---------------------------------------------------------------------------
 
 class StringSessionState(StatesGroup):
-    waiting_for_api_id   = State()   # step 1: user sends API ID
-    waiting_for_api_hash = State()   # step 2: user sends API HASH
-    waiting_for_method   = State()   # step 3: inline button (QR / OTP)
-    waiting_for_phone    = State()   # OTP: user sends phone number
-    waiting_for_otp      = State()   # OTP: user sends verification code
-    waiting_for_2fa      = State()   # shared: user sends 2FA password
+    waiting_for_method = State()   # /string entry: inline button selection
+    waiting_for_phone  = State()   # OTP: user sends phone number
+    waiting_for_otp    = State()   # OTP: user sends verification code
+    waiting_for_2fa    = State()   # shared: user sends 2FA password
 
 
 # ---------------------------------------------------------------------------
-# Session-scoped keyboard helpers
+# Configuration helpers
+# ---------------------------------------------------------------------------
+
+def _get_app_credentials() -> tuple[int, str]:
+    """
+    Read API_ID and API_HASH from the process environment.
+    Raises ValueError with a descriptive message if either is missing.
+    """
+    api_id_str = os.environ.get("API_ID", "").strip()
+    api_hash   = os.environ.get("API_HASH", "").strip()
+    if not api_id_str:
+        raise ValueError("API_ID is not set in the application environment")
+    if not api_hash:
+        raise ValueError("API_HASH is not set in the application environment")
+    return int(api_id_str), api_hash
+
+
+def _is_telegram_app_delivery(result) -> bool:
+    """
+    Return True when Telegram delivered the login code through the Telegram
+    app itself (SentCodeTypeApp).  Such codes cannot be safely re-entered
+    through this bot — Telegram's security layer rejects them with
+    PHONE_CODE_EXPIRED / "previously shared by your account".
+    """
+    if _SENT_CODE_TYPE_APP is None:
+        return False
+    try:
+        return isinstance(result.type, _SENT_CODE_TYPE_APP)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Keyboard helpers (session-scoped only)
 # ---------------------------------------------------------------------------
 
 def _method_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🔢 OTP Login", callback_data="ses_method_otp"),
             InlineKeyboardButton(text="📱 QR Login",  callback_data="ses_method_qr"),
+            InlineKeyboardButton(text="🔢 OTP Login", callback_data="ses_method_otp"),
         ],
         [InlineKeyboardButton(text="❌ Cancel", callback_data="ses_cancel")],
     ])
@@ -113,6 +158,14 @@ def _cancel_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _switch_to_qr_kb() -> InlineKeyboardMarkup:
+    """Offered when a Telegram-app code delivery is detected."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Use QR Login", callback_data="ses_start_qr")],
+        [InlineKeyboardButton(text="❌ Cancel",        callback_data="ses_cancel")],
+    ])
+
+
 def _qr_caption(remaining_secs: int) -> str:
     return (
         "📱 **Telegram QR Login**\n"
@@ -124,8 +177,8 @@ def _qr_caption(remaining_secs: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cleanup — cancels all background tasks and disconnects Telethon client.
-# CRITICAL: never cancel the currently-executing task from within itself.
+# Cleanup — cancels background tasks and disconnects Telethon client.
+# CRITICAL: never cancel the currently-executing asyncio task from itself.
 # ---------------------------------------------------------------------------
 
 async def _cleanup_user_session(user_id: int) -> None:
@@ -170,7 +223,7 @@ async def _qr_countdown(
     accurate remaining-time display.  When the QR token is about to expire,
     calls qr_login.recreate() to obtain a fresh token and replaces the image.
     Falls back to a manual 🔄 Refresh QR button if recreate() fails.
-    Terminates cleanly on CancelledError (cleanup called externally).
+    Terminates cleanly on CancelledError (cleanup is always external).
     """
     current_msg_id = initial_msg_id
     try:
@@ -179,7 +232,7 @@ async def _qr_countdown(
 
             session_data = ACTIVE_CLIENTS.get(user_id)
             if not session_data:
-                return  # session was cleaned up
+                return  # session cleaned up externally
 
             qr_login = session_data.get("qr_login")
             if qr_login is None:
@@ -209,15 +262,13 @@ async def _qr_countdown(
                     finally:
                         qr_buf.close()
 
-                    new_file = BufferedInputFile(qr_bytes, filename="login_qr.png")
-                    caption   = _qr_caption(new_remaining)
-
+                    caption = _qr_caption(new_remaining)
                     try:
                         await bot.edit_message_media(
                             chat_id=chat_id,
                             message_id=current_msg_id,
                             media=InputMediaPhoto(
-                                media=new_file,
+                                media=BufferedInputFile(qr_bytes, filename="login_qr.png"),
                                 caption=caption,
                                 parse_mode="Markdown",
                             ),
@@ -225,7 +276,6 @@ async def _qr_countdown(
                         )
                         session_data["qr_msg_id"] = current_msg_id
                     except TelegramBadRequest:
-                        # Cannot edit — send fresh photo
                         new_msg = await bot.send_photo(
                             chat_id=chat_id,
                             photo=BufferedInputFile(qr_bytes, filename="login_qr.png"),
@@ -244,7 +294,7 @@ async def _qr_countdown(
                         "user_id": user_id,
                         "error": type(exc).__name__,
                     })
-                    # Recreate failed — show manual refresh button
+                    # Recreate failed — give user the manual button
                     try:
                         await bot.edit_message_caption(
                             chat_id=chat_id,
@@ -259,9 +309,8 @@ async def _qr_countdown(
                     except Exception:
                         pass
                     return  # countdown ends; user presses Refresh or Cancel
-
             else:
-                # Normal countdown tick — just update caption
+                # Normal tick — update remaining seconds
                 try:
                     await bot.edit_message_caption(
                         chat_id=chat_id,
@@ -271,12 +320,12 @@ async def _qr_countdown(
                         reply_markup=_qr_kb(),
                     )
                 except TelegramBadRequest:
-                    pass  # "message is not modified" or already deleted
+                    pass  # "message is not modified" — ignore
                 except Exception:
                     pass
 
     except asyncio.CancelledError:
-        raise  # propagate cleanly so cleanup can finish
+        raise  # propagate so cleanup can finish
 
 
 # ---------------------------------------------------------------------------
@@ -291,11 +340,12 @@ async def _wait_for_qr(
 ) -> None:
     """
     Waits indefinitely for the QR to be scanned.
-    Countdown and QR refresh are handled concurrently by _qr_countdown.
+    Countdown / refresh run concurrently in _qr_countdown.
 
-    Success path  → extract StringSession, send to user, clean up.
-    2FA path      → set FSM state, prompt for password, keep client alive.
-    Error/cancel  → report to user, clean up.
+    Success     → extract StringSession, deliver to user, clean up.
+    2FA needed  → set FSM state, prompt for password, keep client alive.
+    Error       → report, clean up.
+    Cancelled   → propagate; cleanup is external.
     """
     session_data = ACTIVE_CLIENTS.get(user_id)
     if session_data is None:
@@ -306,9 +356,8 @@ async def _wait_for_qr(
 
     try:
         try:
-            await qr_login.wait(timeout=None)  # countdown task handles expiry/refresh
+            await qr_login.wait(timeout=None)  # countdown task handles timing
         except SessionPasswordNeededError:
-            # QR was scanned, but account has 2FA
             _stop_countdown(user_id, session_data)
             await state.set_state(StringSessionState.waiting_for_2fa)
             session_data["method"] = "qr"
@@ -336,7 +385,7 @@ async def _wait_for_qr(
         )
 
     except asyncio.CancelledError:
-        raise  # cleanup handles the rest
+        raise
     except Exception as exc:
         logger.error({
             "event": "session_qr_error",
@@ -353,38 +402,37 @@ async def _wait_for_qr(
 
 
 def _stop_countdown(user_id: int, session_data: dict) -> None:
-    """Cancel countdown task without waiting (called from within wait task)."""
+    """Cancel the countdown task without awaiting (safe within the wait task)."""
     ct: asyncio.Task | None = session_data.get("countdown_task")
     if ct and not ct.done() and ct is not asyncio.current_task():
         ct.cancel()
 
 
 # ---------------------------------------------------------------------------
-# /string — entry point (starts conversation)
+# /string — entry point: show login method selection immediately
 # ---------------------------------------------------------------------------
 
 @router.message(Command("string"))
 async def cmd_string(message: Message, state: FSMContext) -> None:
-    """Begin /string flow: clean up any prior attempt, ask for API ID."""
+    """Clean up any prior attempt, then show the method-selection keyboard."""
     user_id = message.from_user.id
-
     if user_id in ACTIVE_CLIENTS:
         await _cleanup_user_session(user_id)
     await state.clear()
-
-    await state.set_state(StringSessionState.waiting_for_api_id)
+    await state.set_state(StringSessionState.waiting_for_method)
     await message.reply(
-        "🔑 **String Session Generator**\n"
+        "🔐 **Choose Login Method**\n"
         "────────────────────\n"
-        "Obtain credentials at https://my.telegram.org\n\n"
-        "Please send your **API ID** (numbers only):",
+        "Select your authentication method:\n\n"
+        "• **QR Login** — scan a QR code *(recommended)*\n"
+        "• **OTP Login** — phone number + verification code",
         parse_mode="Markdown",
-        reply_markup=_cancel_kb(),
+        reply_markup=_method_kb(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Cancel (any state)
+# Cancel — works from any state
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "ses_cancel")
@@ -394,7 +442,6 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
         await _cleanup_user_session(user_id)
     await state.clear()
     try:
-        # Photo messages use edit_caption; text messages use edit_text
         if callback.message.photo:
             await callback.message.edit_caption("❌ Session generation cancelled.")
         else:
@@ -405,80 +452,28 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Conversation step 1 — API ID
-# ---------------------------------------------------------------------------
-
-@router.message(StringSessionState.waiting_for_api_id)
-async def recv_api_id(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    try:
-        api_id = int(text)
-        if api_id <= 0:
-            raise ValueError("must be positive")
-    except ValueError:
-        await message.reply(
-            "❌ API ID must be a positive integer. Please try again:",
-            reply_markup=_cancel_kb(),
-        )
-        return
-
-    await state.update_data(api_id=api_id)
-    await state.set_state(StringSessionState.waiting_for_api_hash)
-    await message.reply(
-        "Now send your **API HASH** (32-character hex string):",
-        parse_mode="Markdown",
-        reply_markup=_cancel_kb(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Conversation step 2 — API HASH
-# ---------------------------------------------------------------------------
-
-@router.message(StringSessionState.waiting_for_api_hash)
-async def recv_api_hash(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if len(text) != 32 or not all(c in "0123456789abcdef" for c in text.lower()):
-        await message.reply(
-            "❌ API HASH must be a 32-character hex string. Please try again:",
-            reply_markup=_cancel_kb(),
-        )
-        return
-
-    await state.update_data(api_hash=text)
-    await state.set_state(StringSessionState.waiting_for_method)
-    await message.reply(
-        "🔐 **Choose Login Method**\n"
-        "────────────────────\n"
-        "Select your authentication method:\n\n"
-        "• **QR Login** — scan a QR code *(recommended, most reliable)*\n"
-        "• **OTP Login** — phone number + verification code\n"
-        "  ⚠️ OTP works only when the code arrives via SMS, not Telegram",
-        parse_mode="Markdown",
-        reply_markup=_method_kb(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Method selection — QR
+# Method selection — QR (initial button)
 # ---------------------------------------------------------------------------
 
 @router.callback_query(StringSessionState.waiting_for_method, F.data == "ses_method_qr")
 async def cb_method_qr(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await callback.answer()
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    try:
+        api_id, api_hash = _get_app_credentials()
+    except ValueError as exc:
+        await callback.message.edit_text(f"❌ Configuration error: {exc}")
+        await state.clear()
+        return
+
     await callback.message.edit_text("📱 Starting QR login…", reply_markup=None)
-
-    user_id  = callback.from_user.id
-    chat_id  = callback.message.chat.id
-    data     = await state.get_data()
-    api_id   = data["api_id"]
-    api_hash = data["api_hash"]
-
     await _start_qr_login(user_id, chat_id, api_id, api_hash, state, bot)
 
 
 # ---------------------------------------------------------------------------
-# Method selection — OTP
+# Method selection — OTP (initial button)
 # ---------------------------------------------------------------------------
 
 @router.callback_query(StringSessionState.waiting_for_method, F.data == "ses_method_otp")
@@ -487,9 +482,6 @@ async def cb_method_otp(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "📞 **OTP Login**\n"
         "────────────────────\n"
-        "⚠️ *OTP login works reliably only when Telegram sends the code via SMS.*\n"
-        "If you receive the code inside the Telegram app on your phone,\n"
-        "login may fail with a Telegram security error — use QR login instead.\n\n"
         "Please send your **phone number** (international format, e.g. +1234567890):",
         parse_mode="Markdown",
         reply_markup=_cancel_kb(),
@@ -498,7 +490,40 @@ async def cb_method_otp(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# QR login startup helper
+# Switch-to-QR button (shown after Telegram-app code-delivery is detected)
+# No state filter — user's FSM state is already cleared at that point.
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "ses_start_qr")
+async def cb_start_qr(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """Start QR login from the 'Use QR Login' button after app-code detection."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    if user_id in ACTIVE_CLIENTS:
+        await _cleanup_user_session(user_id)
+
+    try:
+        api_id, api_hash = _get_app_credentials()
+    except ValueError as exc:
+        try:
+            await callback.message.edit_text(f"❌ Configuration error: {exc}")
+        except TelegramBadRequest:
+            await callback.message.answer(f"❌ Configuration error: {exc}")
+        await state.clear()
+        return
+
+    try:
+        await callback.message.edit_text("📱 Starting QR login…", reply_markup=None)
+    except TelegramBadRequest:
+        await callback.message.answer("📱 Starting QR login…")
+
+    await _start_qr_login(user_id, chat_id, api_id, api_hash, state, bot)
+
+
+# ---------------------------------------------------------------------------
+# QR login startup helper (shared by cb_method_qr and cb_start_qr)
 # ---------------------------------------------------------------------------
 
 async def _start_qr_login(
@@ -509,7 +534,7 @@ async def _start_qr_login(
     state: FSMContext,
     bot: Bot,
 ) -> None:
-    """Connect Telethon client, generate first QR, launch countdown + wait tasks."""
+    """Connect Telethon, generate first QR, launch countdown + wait tasks."""
     client = TelegramClient(StringSession(), api_id, api_hash)
     try:
         await client.connect()
@@ -535,13 +560,12 @@ async def _start_qr_login(
         await bot.send_message(
             chat_id,
             f"❌ Connection failed: `{type(exc).__name__}`\n"
-            "Please verify your API credentials.",
+            "Please check the application's API credentials.",
             parse_mode="Markdown",
         )
         await state.clear()
         return
 
-    # Compute real initial countdown from the token's expiry
     now = datetime.now(timezone.utc)
     try:
         remaining = max(0, int((qr_login.expires - now).total_seconds()))
@@ -584,7 +608,7 @@ async def _start_qr_login(
     ACTIVE_CLIENTS[user_id]["task"]           = wait_task
     ACTIVE_CLIENTS[user_id]["countdown_task"] = countdown_task
 
-    # FSM state cleared: QR phase is driven by background tasks + inline buttons
+    # QR phase is driven entirely by background tasks + inline buttons
     await state.clear()
 
 
@@ -669,11 +693,18 @@ async def cb_qr_refresh(callback: CallbackQuery, bot: Bot) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OTP flow — phone number
+# OTP flow — step 1: phone number
 # ---------------------------------------------------------------------------
 
 @router.message(StringSessionState.waiting_for_phone)
 async def recv_phone(message: Message, state: FSMContext) -> None:
+    """
+    Receive phone number, request the Telegram login code, then inspect the
+    delivery method.  If Telegram routed the code through the Telegram app
+    (SentCodeTypeApp) we abort immediately and redirect to QR login — those
+    codes are rejected by Telegram when re-entered through another Telegram
+    chat (security restriction: "previously shared by your account").
+    """
     phone = (message.text or "").strip()
     if not phone.startswith("+") or len(phone) < 7:
         await message.reply(
@@ -682,11 +713,15 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         )
         return
 
-    data     = await state.get_data()
-    api_id   = data["api_id"]
-    api_hash = data["api_hash"]
-    user_id  = message.from_user.id
-    chat_id  = message.chat.id
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    try:
+        api_id, api_hash = _get_app_credentials()
+    except ValueError as exc:
+        await message.reply(f"❌ Configuration error: {exc}")
+        await state.clear()
+        return
 
     client = TelegramClient(StringSession(), api_id, api_hash)
     try:
@@ -711,12 +746,34 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         logger.error({"event": "otp_send_error", "error": type(exc).__name__})
         await message.reply(
             f"❌ Failed to send code: `{type(exc).__name__}`\n"
-            "Verify your credentials or use QR login.",
+            "Please verify the phone number or use QR login.",
             parse_mode="Markdown",
         )
         await state.clear()
         return
 
+    # ── Delivery-type gate ────────────────────────────────────────────────
+    # SentCodeTypeApp means the code is inside the user's Telegram app.
+    # Re-entering it here would trigger Telegram's security block.
+    # Disconnect the temporary client and redirect to QR immediately.
+    if _is_telegram_app_delivery(result):
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await state.clear()
+        await message.reply(
+            "⚠️ **Telegram sent this login code inside the Telegram app.**\n\n"
+            "For security, Telegram rejects codes that are shared through "
+            "another Telegram chat.\n\n"
+            "Please use **QR Login** instead:",
+            parse_mode="Markdown",
+            reply_markup=_switch_to_qr_kb(),
+        )
+        return
+    # ─────────────────────────────────────────────────────────────────────
+
+    # Usable delivery (SMS, call, fragment, …) — proceed to code entry
     ACTIVE_CLIENTS[user_id] = {
         "client":          client,
         "chat_id":         chat_id,
@@ -728,12 +785,9 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         "countdown_task":  None,
     }
 
-    await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
     await state.set_state(StringSessionState.waiting_for_otp)
     await message.reply(
-        "📨 A verification code has been sent.\n\n"
-        "⚠️ *If the code arrives via Telegram (not SMS), the login may be blocked.*\n"
-        "Cancel and use QR login in that case.\n\n"
+        "📨 A verification code has been sent to your phone.\n\n"
         "Please send the **verification code**:",
         parse_mode="Markdown",
         reply_markup=_cancel_kb(),
@@ -741,7 +795,7 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OTP flow — verification code
+# OTP flow — step 2: verification code
 # ---------------------------------------------------------------------------
 
 @router.message(StringSessionState.waiting_for_otp)
@@ -759,11 +813,12 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
         return
 
     client: TelegramClient = session_data["client"]
-    phone:            str  = session_data["phone"]
-    phone_code_hash:  str  = session_data["phone_code_hash"]
+    phone:           str   = session_data["phone"]
+    phone_code_hash: str   = session_data["phone_code_hash"]
 
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+
     except SessionPasswordNeededError:
         await state.set_state(StringSessionState.waiting_for_2fa)
         session_data["method"] = "otp"
@@ -774,12 +829,43 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
             reply_markup=_cancel_kb(),
         )
         return
+
     except PhoneCodeInvalidError:
         await message.reply(
             "❌ Incorrect verification code. Please try again:",
             reply_markup=_cancel_kb(),
         )
         return
+
+    except PhoneCodeExpiredError:
+        # This can mean the code genuinely timed out, OR that Telegram
+        # rejected it because it was delivered through the Telegram app
+        # (and we missed the type check — e.g. Telethon type unavailable).
+        await _cleanup_user_session(user_id)
+        await state.clear()
+        logger.warning({"event": "otp_code_expired_or_shared", "user_id": user_id})
+        await message.reply(
+            "⏱️ **Telegram rejected this verification code.**\n\n"
+            "This happens when:\n"
+            "• The code was delivered via the Telegram app and cannot be "
+            "re-entered through another Telegram chat (Telegram security "
+            "restriction: *previously shared by your account*)\n"
+            "• The code genuinely expired before you entered it\n\n"
+            "👉 **Use QR Login** for reliable authentication — run `/string` "
+            "and select *QR Login*.",
+            parse_mode="Markdown",
+        )
+        return
+
+    except FloodWaitError as exc:
+        await _cleanup_user_session(user_id)
+        await state.clear()
+        await message.reply(
+            f"⏳ Too many attempts. Please wait **{exc.seconds}s** before trying again.",
+            parse_mode="Markdown",
+        )
+        return
+
     except Exception as exc:
         await _cleanup_user_session(user_id)
         await state.clear()
@@ -789,12 +875,13 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
             "error": type(exc).__name__,
         })
         await message.reply(
-            f"❌ Login failed: `{type(exc).__name__}`\n"
-            "If Telegram blocked the code, please use QR login instead.",
+            "❌ Login failed due to an unexpected error.\n"
+            "Please use **QR Login** for a more reliable authentication method.",
             parse_mode="Markdown",
         )
         return
 
+    # Success ✓
     string_session: str = client.session.save()
     await _cleanup_user_session(user_id)
     await state.clear()
@@ -856,8 +943,7 @@ async def process_2fa(message: Message, state: FSMContext) -> None:
             "error": type(exc).__name__,
         })
         await message.reply(
-            f"❌ **2FA Error:** `{type(exc).__name__}`\n"
-            "Please try `/string` again.",
+            "❌ 2FA failed due to an unexpected error. Please try `/string` again.",
             parse_mode="Markdown",
         )
 
