@@ -1325,11 +1325,15 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("API_ID",               src)
         self.assertIn("API_HASH",             src)
 
-    def test_telegram_app_delivery_helper_in_source(self):
-        """Router must declare _is_telegram_app_delivery for delivery-type gate."""
+    def test_no_pre_emptive_delivery_gate_in_source(self):
+        """recv_phone must NOT contain a pre-emptive delivery-type gate;
+        the rejection is handled at sign-in time in recv_otp instead."""
         src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
-        self.assertIn("_is_telegram_app_delivery", src)
-        self.assertIn("SentCodeTypeApp",           src)
+        # Dead helper must be gone
+        self.assertNotIn("_is_telegram_app_delivery", src)
+        self.assertNotIn("_SENT_CODE_TYPE_APP",       src)
+        # QR-fallback keyboard still needed for recv_otp error handler
+        self.assertIn("_switch_to_qr_kb", src)
 
     def test_switch_to_qr_keyboard_in_source(self):
         """ses_start_qr callback must exist for the 'Use QR Login' button."""
@@ -1392,70 +1396,37 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
             os.environ.update(env_backup)
 
     # ------------------------------------------------------------------
-    # _is_telegram_app_delivery helper
+    # recv_phone: always proceeds to OTP state
     # ------------------------------------------------------------------
 
-    def test_is_telegram_app_delivery_true(self):
-        """Returns True when result.type is SentCodeTypeApp."""
-        self._skip_no_telethon()
-        from app.features.session import router as sess_mod
-
-        if sess_mod._SENT_CODE_TYPE_APP is None:
-            self.skipTest("SentCodeTypeApp not importable in this Telethon build")
-
-        fake_result = MagicMock()
-        fake_result.type = sess_mod._SENT_CODE_TYPE_APP()
-        self.assertTrue(sess_mod._is_telegram_app_delivery(fake_result))
-
-    def test_is_telegram_app_delivery_false_for_sms(self):
-        """Returns False for any non-App delivery type."""
-        self._skip_no_telethon()
-        from app.features.session import router as sess_mod
-
-        fake_result = MagicMock()
-        fake_result.type = MagicMock()   # not SentCodeTypeApp
-        # Only returns True for the exact SentCodeTypeApp class
-        self.assertFalse(sess_mod._is_telegram_app_delivery(fake_result))
-
-    def test_is_telegram_app_delivery_none_sentinel(self):
-        """When _SENT_CODE_TYPE_APP is None (import failed), returns False."""
-        self._skip_no_telethon()
-        from app.features.session import router as sess_mod
-        from unittest.mock import patch
-
-        with patch.object(sess_mod, "_SENT_CODE_TYPE_APP", None):
-            fake_result = MagicMock()
-            self.assertFalse(sess_mod._is_telegram_app_delivery(fake_result))
-
-    # ------------------------------------------------------------------
-    # recv_phone: Telegram-app delivery detection
-    # ------------------------------------------------------------------
-
-    async def test_recv_phone_telegram_app_delivery_redirects_to_qr(self):
+    async def test_recv_phone_always_proceeds_to_otp_for_app_delivery(self):
         """
-        When send_code_request returns SentCodeTypeApp, recv_phone must
-        NOT set waiting_for_otp state, must disconnect the temp client,
-        and must show the 'Use QR Login' button.
+        recv_phone must set waiting_for_otp even when send_code_request()
+        returns a SentCodeTypeApp-like result.  The rejection is handled
+        at sign-in time in recv_otp(), not upfront here.
         """
         self._skip_no_telethon()
         from app.features.session import router as sess_mod
         from unittest.mock import patch, AsyncMock as AM
 
+        # Simulate SentCodeTypeApp by giving result.type any object —
+        # recv_phone no longer inspects it.
+        fake_result = MagicMock()
+        fake_result.phone_code_hash = "hash_app"
+        fake_result.type = MagicMock()          # would be SentCodeTypeApp in prod
+
         fake_client = MagicMock()
         fake_client.connect    = AM()
         fake_client.disconnect = AM()
-        fake_result  = MagicMock()
+        fake_client.send_code_request = AM(return_value=fake_result)
 
         user_id = 70001
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
 
         with patch("app.features.session.router.TelegramClient",
                    return_value=fake_client), \
              patch("app.features.session.router._get_app_credentials",
-                   return_value=(12345, "abc")), \
-             patch("app.features.session.router._is_telegram_app_delivery",
-                   return_value=True):
-
-            fake_client.send_code_request = AM(return_value=fake_result)
+                   return_value=(12345, "abc")):
 
             state   = AsyncMock()
             message = MagicMock()
@@ -1468,32 +1439,20 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
 
             await sess_mod.recv_phone(message, state)
 
-        # Must NOT proceed to OTP
-        for call in state.set_state.call_args_list:
-            self.assertNotEqual(
-                call.args[0] if call.args else None,
-                sess_mod.StringSessionState.waiting_for_otp,
-                "waiting_for_otp must not be set when code is Telegram-app delivered",
-            )
-        # Must clear state and disconnect client
-        state.clear.assert_called()
-        fake_client.disconnect.assert_called()
-        # Must NOT create ACTIVE_CLIENTS entry
-        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
-        # Must show QR redirect (message contains "ses_start_qr" via keyboard)
-        message.reply.assert_called_once()
-        call_kwargs = message.reply.call_args[1]
-        # The reply_markup must contain ses_start_qr button
-        markup = call_kwargs.get("reply_markup")
-        self.assertIsNotNone(markup)
-        buttons_flat = [btn.callback_data
-                        for row in markup.inline_keyboard for btn in row]
-        self.assertIn("ses_start_qr", buttons_flat)
+        # Must proceed to OTP — not block or redirect
+        state.set_state.assert_called_with(
+            sess_mod.StringSessionState.waiting_for_otp
+        )
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        # Must NOT disconnect the client (session is still needed)
+        fake_client.disconnect.assert_not_called()
+
+        await sess_mod._cleanup_user_session(user_id)
 
     async def test_recv_phone_usable_delivery_proceeds_to_otp(self):
         """
-        When send_code_request returns a non-App type, recv_phone must
-        set waiting_for_otp and create an ACTIVE_CLIENTS entry.
+        Regardless of delivery type, recv_phone must set waiting_for_otp
+        and create an ACTIVE_CLIENTS entry.
         """
         self._skip_no_telethon()
         from app.features.session import router as sess_mod
@@ -1512,9 +1471,7 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
         with patch("app.features.session.router.TelegramClient",
                    return_value=fake_client), \
              patch("app.features.session.router._get_app_credentials",
-                   return_value=(12345, "abc")), \
-             patch("app.features.session.router._is_telegram_app_delivery",
-                   return_value=False):
+                   return_value=(12345, "abc")):
 
             state   = AsyncMock()
             message = MagicMock()
@@ -1536,11 +1493,15 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
     # recv_otp: PhoneCodeExpiredError mapping
     # ------------------------------------------------------------------
 
-    async def test_recv_otp_phone_code_expired_friendly_message(self):
+    async def test_recv_otp_phone_code_expired_shows_qr_button(self):
         """
-        PhoneCodeExpiredError must produce a user-friendly explanation that
-        mentions the Telegram security restriction and recommends QR login.
-        It must NOT show a raw exception name to the user.
+        PhoneCodeExpiredError (covers both genuine expiry and Telegram's
+        "previously shared by your account" rejection) must:
+        - produce a user-friendly message (no raw exception name)
+        - mention QR login
+        - include the 'Use QR Login' inline button (ses_start_qr)
+        This is where Telegram-delivered-code rejections are surfaced —
+        NOT pre-emptively in recv_phone.
         """
         self._skip_no_telethon()
         from telethon.errors import PhoneCodeExpiredError
@@ -1549,9 +1510,7 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
         user_id = 71001
 
         fake_client = MagicMock()
-        fake_client.sign_in = AsyncMock(
-            side_effect=PhoneCodeExpiredError(None)
-        )
+        fake_client.sign_in      = AsyncMock(side_effect=PhoneCodeExpiredError(None))
         fake_client.is_connected = MagicMock(return_value=True)
         fake_client.disconnect   = AsyncMock()
 
@@ -1579,11 +1538,20 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
         state.clear.assert_called_once()
 
-        reply_text = message.reply.call_args[0][0]
-        # Must NOT expose the raw exception class name
+        call_kwargs = message.reply.call_args[1]
+        reply_text  = message.reply.call_args[0][0]
+
+        # Must NOT expose raw exception class name
         self.assertNotIn("PhoneCodeExpiredError", reply_text)
         # Must mention QR as alternative
         self.assertIn("QR", reply_text)
+        # Must provide the 'Use QR Login' button
+        markup = call_kwargs.get("reply_markup")
+        self.assertIsNotNone(markup, "reply_markup must be set on PhoneCodeExpiredError")
+        buttons_flat = [btn.callback_data
+                        for row in markup.inline_keyboard for btn in row]
+        self.assertIn("ses_start_qr", buttons_flat,
+                      "ses_start_qr button must be present in the error message")
 
     # ------------------------------------------------------------------
     # ses_start_qr callback

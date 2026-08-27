@@ -58,16 +58,6 @@ from app.platform.capability import FeatureManifest
 from app.utils.qr import generate_qr_buffer
 from app.core.logger import setup_logger
 
-# ---------------------------------------------------------------------------
-# Attempt to import SentCodeTypeApp for delivery-type detection.
-# If the import fails (e.g. older Telethon build), we fall through safely.
-# ---------------------------------------------------------------------------
-try:
-    from telethon.tl.types import auth as _tl_auth_types
-    _SENT_CODE_TYPE_APP = _tl_auth_types.SentCodeTypeApp
-except (ImportError, AttributeError):
-    _SENT_CODE_TYPE_APP = None
-
 manifest = FeatureManifest(
     name="session",
     description="Telegram String Session Generator via QR or OTP Login",
@@ -114,21 +104,6 @@ def _get_app_credentials() -> tuple[int, str]:
     if not api_hash:
         raise ValueError("API_HASH is not set in the application environment")
     return int(api_id_str), api_hash
-
-
-def _is_telegram_app_delivery(result) -> bool:
-    """
-    Return True when Telegram delivered the login code through the Telegram
-    app itself (SentCodeTypeApp).  Such codes cannot be safely re-entered
-    through this bot — Telegram's security layer rejects them with
-    PHONE_CODE_EXPIRED / "previously shared by your account".
-    """
-    if _SENT_CODE_TYPE_APP is None:
-        return False
-    try:
-        return isinstance(result.type, _SENT_CODE_TYPE_APP)
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -722,11 +697,11 @@ async def cb_qr_refresh(callback: CallbackQuery, bot: Bot) -> None:
 @router.message(StringSessionState.waiting_for_phone)
 async def recv_phone(message: Message, state: FSMContext) -> None:
     """
-    Receive phone number, request the Telegram login code, then inspect the
-    delivery method.  If Telegram routed the code through the Telegram app
-    (SentCodeTypeApp) we abort immediately and redirect to QR login — those
-    codes are rejected by Telegram when re-entered through another Telegram
-    chat (security restriction: "previously shared by your account").
+    Receive phone number and request the Telegram login code.
+    Always proceeds to the OTP-input state regardless of the delivery method
+    reported by Telegram.  If Telegram later rejects the code at sign-in
+    time (e.g. PHONE_CODE_EXPIRED / "previously shared by your account"),
+    recv_otp() handles that error and offers the QR-login fallback.
     """
     phone = (message.text or "").strip()
     if not phone.startswith("+") or len(phone) < 7:
@@ -775,28 +750,9 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    # ── Delivery-type gate ────────────────────────────────────────────────
-    # SentCodeTypeApp means the code is inside the user's Telegram app.
-    # Re-entering it here would trigger Telegram's security block.
-    # Disconnect the temporary client and redirect to QR immediately.
-    if _is_telegram_app_delivery(result):
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        await state.clear()
-        await message.reply(
-            "⚠️ **Telegram sent this login code inside the Telegram app.**\n\n"
-            "For security, Telegram rejects codes that are shared through "
-            "another Telegram chat.\n\n"
-            "Please use **QR Login** instead:",
-            parse_mode="Markdown",
-            reply_markup=_switch_to_qr_kb(),
-        )
-        return
-    # ─────────────────────────────────────────────────────────────────────
-
-    # Usable delivery (SMS, call, fragment, …) — proceed to code entry
+    # All delivery types proceed to OTP input.
+    # Telegram-delivered codes (SentCodeTypeApp) may be rejected at sign-in
+    # time — recv_otp() catches that and offers QR login.
     ACTIVE_CLIENTS[user_id] = {
         "client":          client,
         "chat_id":         chat_id,
@@ -861,22 +817,23 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
         return
 
     except PhoneCodeExpiredError:
-        # This can mean the code genuinely timed out, OR that Telegram
-        # rejected it because it was delivered through the Telegram app
-        # (and we missed the type check — e.g. Telethon type unavailable).
+        # Raised when Telegram refuses the code — either because it genuinely
+        # timed out, or because it was delivered through the Telegram app and
+        # Telegram's security layer blocks re-entry ("previously shared by
+        # your account").  Both cases map to the same user-facing action:
+        # try QR login.
         await _cleanup_user_session(user_id)
         await state.clear()
         logger.warning({"event": "otp_code_expired_or_shared", "user_id": user_id})
         await message.reply(
             "⏱️ **Telegram rejected this verification code.**\n\n"
             "This happens when:\n"
-            "• The code was delivered via the Telegram app and cannot be "
-            "re-entered through another Telegram chat (Telegram security "
-            "restriction: *previously shared by your account*)\n"
+            "• The code was delivered via the Telegram app and Telegram "
+            "blocks re-entry here (*previously shared by your account*)\n"
             "• The code genuinely expired before you entered it\n\n"
-            "👉 **Use QR Login** for reliable authentication — run `/string` "
-            "and select *QR Login*.",
+            "👉 Please use **QR Login** for reliable authentication:",
             parse_mode="Markdown",
+            reply_markup=_switch_to_qr_kb(),
         )
         return
 
