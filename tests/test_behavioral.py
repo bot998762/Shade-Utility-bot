@@ -2701,5 +2701,318 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("0s", caption)
 
 
+class TestOTPAuthRestartError(unittest.IsolatedAsyncioTestCase):
+    """
+    Tests for explicit AuthRestartError handling in the OTP path.
+    AuthRestartError means Telegram invalidated the auth state and requires
+    a completely fresh login attempt.  All three OTP handlers must catch it
+    specifically, clean up, and direct the user to run /string again.
+    QR code is not involved and is not tested here.
+    """
+
+    def _skip_no_telethon(self):
+        try:
+            import telethon  # noqa: F401
+        except ImportError:
+            self.skipTest("telethon not installed")
+
+    # ------------------------------------------------------------------
+    # Source-level checks
+    # ------------------------------------------------------------------
+
+    def test_auth_restart_error_imported(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("AuthRestartError", src)
+
+    def test_auth_restart_caught_in_recv_phone(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("otp_auth_restart_on_send", src)
+
+    def test_auth_restart_caught_in_recv_otp(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("otp_auth_restart_on_sign_in", src)
+
+    def test_auth_restart_caught_in_process_2fa(self):
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertIn("otp_2fa_auth_restart", src)
+
+    # ------------------------------------------------------------------
+    # recv_phone: AuthRestartError during send_code_request
+    # ------------------------------------------------------------------
+
+    async def test_recv_phone_auth_restart_cleans_up_and_directs_restart(self):
+        """
+        AuthRestartError from send_code_request must disconnect the temp
+        client, clear FSM state, and tell the user to run /string again.
+        No ACTIVE_CLIENTS entry must be created.
+        """
+        self._skip_no_telethon()
+        from telethon.errors import AuthRestartError
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 80001
+        fake_client = MM()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(side_effect=AuthRestartError(None))
+
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client),              patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+
+            state   = MM()
+            state.clear     = AM()
+            state.set_state = AM()
+            message = MM()
+            message.from_user    = MM()
+            message.from_user.id = user_id
+            message.chat         = MM()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        # No session must be stored
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        # Client must be disconnected
+        fake_client.disconnect.assert_called()
+        # FSM must be cleared, not advanced
+        state.clear.assert_called_once()
+        state.set_state.assert_not_called()
+        # User must be told to restart
+        reply_text = message.reply.call_args[0][0].lower()
+        self.assertIn("string", reply_text)   # tells user to /string again
+
+    # ------------------------------------------------------------------
+    # recv_otp: AuthRestartError during sign_in
+    # ------------------------------------------------------------------
+
+    async def test_recv_otp_auth_restart_cleans_up_and_directs_restart(self):
+        """
+        AuthRestartError from sign_in must clean up ACTIVE_CLIENTS, clear
+        FSM state, and tell the user to run /string again.
+        """
+        self._skip_no_telethon()
+        from telethon.errors import AuthRestartError
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+        user_id = 80002
+
+        fake_client = MM()
+        fake_client.sign_in      = AM(side_effect=AuthRestartError(None))
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "somehash",
+            "delivery":        "the Telegram app",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "12345"
+        message.reply        = AM()
+
+        await sess_mod.recv_otp(message, state)
+
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        state.clear.assert_called_once()
+        reply_text = message.reply.call_args[0][0].lower()
+        self.assertIn("string", reply_text)   # tells user to /string again
+
+    async def test_recv_otp_auth_restart_logs_warning_not_error(self):
+        """
+        AuthRestartError is not a code bug — it must be logged as warning,
+        not error, and must include client_id for tracing.
+        """
+        self._skip_no_telethon()
+        from telethon.errors import AuthRestartError
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM, patch
+
+        user_id = 80003
+
+        fake_client = MM()
+        fake_client.sign_in      = AM(side_effect=AuthRestartError(None))
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "x" * 20,
+            "delivery":        "the Telegram app",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        logged_warnings = []
+        def capture(data):
+            logged_warnings.append(data)
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "12345"
+        message.reply        = AM()
+
+        with patch.object(sess_mod.logger, "warning", side_effect=capture):
+            await sess_mod.recv_otp(message, state)
+
+        restart_warnings = [w for w in logged_warnings if isinstance(w, dict)
+                            and w.get("event") == "otp_auth_restart_on_sign_in"]
+        self.assertEqual(len(restart_warnings), 1)
+        self.assertEqual(restart_warnings[0]["user_id"], user_id)
+        self.assertIn("client_id", restart_warnings[0])
+
+    # ------------------------------------------------------------------
+    # process_2fa: AuthRestartError during 2FA sign_in
+    # ------------------------------------------------------------------
+
+    async def test_process_2fa_auth_restart_cleans_up_and_directs_restart(self):
+        """
+        AuthRestartError from sign_in(password=...) must clean up the session,
+        clear FSM state, and tell the user to run /string again.
+        """
+        self._skip_no_telethon()
+        from telethon.errors import AuthRestartError
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+        user_id = 80004
+
+        fake_client = MM()
+        fake_client.sign_in      = AM(side_effect=AuthRestartError(None))
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":         fake_client,
+            "method":         "otp",
+            "chat_id":        1,
+            "task":           None,
+            "countdown_task": None,
+            "created_at":     0,
+        }
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "mypassword"
+        message.reply        = AM()
+
+        await sess_mod.process_2fa(message, state)
+
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        state.clear.assert_called_once()
+        reply_text = message.reply.call_args[0][0].lower()
+        self.assertIn("string", reply_text)   # tells user to /string again
+
+    # ------------------------------------------------------------------
+    # Regression: prior OTP error handlers still work after patch
+    # ------------------------------------------------------------------
+
+    async def test_recv_otp_session_password_needed_sets_2fa_state(self):
+        """
+        SessionPasswordNeededError must set waiting_for_2fa state and prompt
+        the user for their 2FA password — confirming the 2FA path is intact.
+        """
+        self._skip_no_telethon()
+        from telethon.errors import SessionPasswordNeededError
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+        user_id = 80005
+
+        fake_client = MM()
+        fake_client.sign_in      = AM(side_effect=SessionPasswordNeededError(None))
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "goodhash",
+            "delivery":        "SMS",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "12345"
+        message.reply        = AM()
+
+        await sess_mod.recv_otp(message, state)
+
+        # Session MUST be kept alive for 2FA step
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        # FSM must advance to waiting_for_2fa
+        state.set_state.assert_called_once_with(
+            sess_mod.StringSessionState.waiting_for_2fa
+        )
+        state.clear.assert_not_called()
+        # User must be prompted for password
+        reply_text = message.reply.call_args[0][0].lower()
+        self.assertTrue(
+            "2fa" in reply_text or "password" in reply_text or
+            "verification" in reply_text or "two-step" in reply_text,
+            f"Expected 2FA prompt, got: {reply_text!r}",
+        )
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_qr_source_unchanged(self):
+        """
+        QR-specific functions must still be present in the source and must
+        not have been modified by the OTP-only patch.
+        """
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        for fn in ("_qr_countdown", "_wait_for_qr", "_start_qr_login",
+                   "_stop_countdown", "cb_qr_refresh", "cb_method_qr"):
+            self.assertIn(fn, src, f"QR function {fn!r} missing after OTP patch")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

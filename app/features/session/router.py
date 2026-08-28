@@ -54,6 +54,7 @@ from telethon.errors import (
     PhoneCodeExpiredError,
     PasswordHashInvalidError,
     PhoneNumberInvalidError,
+    AuthRestartError,
 )
 
 # ResendCodeRequest sends auth.resendCode(phone_number, phone_code_hash)
@@ -813,6 +814,21 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         )
         # Keep state — let user correct the number without restarting
         return
+    except AuthRestartError:
+        # Telegram signalled that the auth flow must restart from scratch.
+        # Disconnect the temporary client and ask the user to run /string again.
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        logger.warning({"event": "otp_auth_restart_on_send", "user_id": user_id})
+        await message.reply(
+            "⚠️ Telegram interrupted the login flow and requires a fresh start.\n\n"
+            "Please run `/string` again to begin a new login attempt.",
+            parse_mode="Markdown",
+        )
+        await state.clear()
+        return
     except Exception as exc:
         try:
             await client.disconnect()
@@ -1087,6 +1103,22 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
         )
         return
 
+    except AuthRestartError:
+        # Telegram requires the auth flow to be restarted completely.
+        # The current phone_code_hash and client state are no longer valid.
+        await _cleanup_user_session(user_id)
+        await state.clear()
+        logger.warning({
+            "event":     "otp_auth_restart_on_sign_in",
+            "user_id":   user_id,
+            "client_id": id(client),
+        })
+        await message.reply(
+            "⚠️ The Telegram login session was interrupted and must restart.\n\n"
+            "Please run `/string` to begin a fresh login attempt.",
+            parse_mode="Markdown",
+        )
+        return
     except Exception as exc:
         await _cleanup_user_session(user_id)
         await state.clear()
@@ -1155,6 +1187,17 @@ async def process_2fa(message: Message, state: FSMContext) -> None:
         await message.reply(
             "❌ Incorrect 2FA password. Please try again:",
             reply_markup=_cancel_kb(),
+        )
+    except AuthRestartError:
+        # Telegram invalidated the auth session during 2FA.
+        # The client must be discarded and the user must start over.
+        await _cleanup_user_session(user_id)
+        await state.clear()
+        logger.warning({"event": "otp_2fa_auth_restart", "user_id": user_id})
+        await message.reply(
+            "⚠️ The Telegram session was interrupted during 2FA.\n\n"
+            "Please run `/string` to start a fresh login attempt.",
+            parse_mode="Markdown",
         )
     except Exception as exc:
         await _cleanup_user_session(user_id)
