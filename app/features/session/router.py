@@ -7,11 +7,13 @@ Users never supply credentials — they only authenticate their Telegram account
 Login methods:
   1. QR Login (recommended) — out-of-band scan; completely avoids Telegram's
      "code previously shared by your account" security restriction.
-  2. OTP Login — phone number + verification code. Works ONLY when Telegram
-     routes the code via SMS or a phone call (SentCodeTypeSms / Call / etc.).
-     If Telegram routes the code through the Telegram app itself
-     (SentCodeTypeApp), the code CANNOT be re-entered here — Telegram will
-     reject it. The bot detects this upfront and redirects to QR login.
+  2. OTP Login — phone number + verification code.
+     • If Telegram's SentCode indicates an alternative delivery method
+       (next_type), a "Resend via SMS/Call" button is shown once.
+     • The resend uses auth.ResendCode (a legitimate Telegram API call)
+       to obtain a fresh code via a non-app channel.
+     • If sign_in() is rejected ("previously shared"), the user is offered
+       QR login as a fallback.
 
 State machine:
   IDLE
@@ -19,8 +21,7 @@ State machine:
                  ├─(ses_method_qr / ses_start_qr)──► [bg tasks]──► AUTHENTICATED
                  │                                              └──► WAITING_2FA ──► AUTHENTICATED
                  ├─(ses_method_otp)──► WAITING_PHONE
-                 │      └─(phone ok, type=App)──► IDLE (show ses_start_qr button)
-                 │      └─(phone ok, type=usable)──► WAITING_OTP
+                 │      └─(phone ok)──► WAITING_OTP [Resend button if next_type set]
                  │                   ├─► AUTHENTICATED
                  │                   └─► WAITING_2FA ──► AUTHENTICATED
                  └─(ses_cancel anywhere)──► IDLE
@@ -52,7 +53,16 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     PasswordHashInvalidError,
+    PhoneNumberInvalidError,
 )
+
+# ResendCodeRequest sends auth.resendCode(phone_number, phone_code_hash)
+# and returns a new SentCode with a fresh phone_code_hash.
+# Available in Telethon since 1.x (generated from TL schema).
+try:
+    from telethon.tl.functions.auth import ResendCodeRequest as _TLResendCodeRequest
+except (ImportError, AttributeError):
+    _TLResendCodeRequest = None  # guarded at call sites
 
 from app.platform.capability import FeatureManifest
 from app.utils.qr import generate_qr_buffer
@@ -139,6 +149,61 @@ def _switch_to_qr_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📱 Use QR Login", callback_data="ses_start_qr")],
         [InlineKeyboardButton(text="❌ Cancel",        callback_data="ses_cancel")],
     ])
+
+
+def _describe_current_type(result) -> str:
+    """
+    Human-readable description of how Telegram delivered the login code.
+    Uses the type-name of result.type so no brittle isinstance() import needed.
+    """
+    try:
+        name = type(result.type).__name__
+    except Exception:
+        return "your phone"
+    if "App"      in name:
+        return "the Telegram app"
+    if "Sms"      in name:
+        return "SMS"
+    if "Call"     in name or "Flash" in name or "Missed" in name:
+        return "a phone call"
+    if "Email"    in name:
+        return "email"
+    if "Fragment" in name:
+        return "Fragment"
+    return "your phone"
+
+
+def _describe_next_type(next_type) -> str:
+    """
+    Human-readable label for the next available delivery method.
+    next_type is a CodeType* instance from telethon.tl.types.auth.
+    (CodeTypeSms, CodeTypeCall, CodeTypeFlashCall, CodeTypeMissedCall)
+    """
+    if next_type is None:
+        return ""
+    name = type(next_type).__name__
+    if "Sms"   in name:
+        return "SMS"
+    if "Call"  in name or "Flash" in name or "Missed" in name:
+        return "Phone Call"
+    return "alternative method"
+
+
+def _otp_input_kb(next_type=None) -> InlineKeyboardMarkup:
+    """
+    Keyboard shown on the OTP input prompt.
+    Includes a 'Resend via …' button only when Telegram indicated a next_type
+    in the SentCode response — i.e. an alternative delivery channel exists.
+    """
+    rows = []
+    if next_type is not None:
+        label = _describe_next_type(next_type)
+        rows.append([InlineKeyboardButton(
+            text=f"📲 Resend via {label}",
+            callback_data="ses_otp_resend",
+        )])
+    rows.append([InlineKeyboardButton(text="❌ Cancel", callback_data="ses_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _qr_caption(remaining_secs: int) -> str:
@@ -736,6 +801,18 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         )
         await state.clear()
         return
+    except PhoneNumberInvalidError:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.reply(
+            "❌ That phone number is not valid. "
+            "Please check the number and try again:",
+            reply_markup=_cancel_kb(),
+        )
+        # Keep state — let user correct the number without restarting
+        return
     except Exception as exc:
         try:
             await client.disconnect()
@@ -750,27 +827,142 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    # All delivery types proceed to OTP input.
-    # Telegram-delivered codes (SentCodeTypeApp) may be rejected at sign-in
-    # time — recv_otp() catches that and offers QR login.
+    # ── Inspect delivery type and optional next_type ──────────────────────
+    # SentCode.next_type (CodeType* instance or None) indicates whether
+    # Telegram can resend via an alternative channel (SMS, Call, …).
+    # We expose this as a one-shot Resend button — no automatic resends.
+    delivery  = _describe_current_type(result)
+    next_type = getattr(result, "next_type", None)
+
+    if next_type is not None:
+        next_label = _describe_next_type(next_type)
+        prompt = (
+            f"📨 Telegram sent the login code via **{delivery}**.\n\n"
+            f"If you cannot use that code here, tap "
+            f"**Resend via {next_label}** to receive a fresh code "
+            f"via {next_label} instead.\n\n"
+            "Please send the **verification code**:"
+        )
+    else:
+        prompt = (
+            f"📨 A verification code has been sent via {delivery}.\n\n"
+            "Please send the **verification code**:"
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     ACTIVE_CLIENTS[user_id] = {
         "client":          client,
         "chat_id":         chat_id,
         "method":          "otp",
         "phone":           phone,
         "phone_code_hash": result.phone_code_hash,
+        "next_type":       next_type,   # CodeType* or None
+        "resent":          False,       # True after one ResendCode call
         "created_at":      time.monotonic(),
         "task":            None,
         "countdown_task":  None,
     }
 
     await state.set_state(StringSessionState.waiting_for_otp)
-    await message.reply(
-        "📨 A verification code has been sent to your phone.\n\n"
-        "Please send the **verification code**:",
-        parse_mode="Markdown",
-        reply_markup=_cancel_kb(),
-    )
+    await message.reply(prompt, parse_mode="Markdown", reply_markup=_otp_input_kb(next_type))
+
+
+# ---------------------------------------------------------------------------
+# OTP resend — one-shot, only when Telegram reported a next_type
+# ---------------------------------------------------------------------------
+
+@router.callback_query(StringSessionState.waiting_for_otp, F.data == "ses_otp_resend")
+async def cb_otp_resend(callback: CallbackQuery) -> None:
+    """
+    Resend the Telegram login code via the next available delivery method
+    (e.g. SMS after an app-delivered code).
+
+    Rules:
+    • Only one resend per OTP session (avoids duplicate codes / FloodWait).
+    • Uses auth.ResendCode (Telegram's official resend API, Telethon 1.x).
+    • Updates phone_code_hash in session — old hash is invalidated by Telegram.
+    • Removes the Resend button after use.
+    """
+    await callback.answer()
+    user_id = callback.from_user.id
+
+    session_data = ACTIVE_CLIENTS.get(user_id)
+    if not session_data:
+        try:
+            await callback.message.edit_text(
+                "❌ Session expired. Please run `/string` again.",
+                parse_mode="Markdown",
+            )
+        except TelegramBadRequest:
+            pass
+        return
+
+    # Guard: only one resend allowed per session
+    if session_data.get("resent"):
+        await callback.answer(
+            "Code already resent. Please enter the code you received.",
+            show_alert=True,
+        )
+        return
+
+    next_type = session_data.get("next_type")
+    if next_type is None:
+        await callback.answer(
+            "No alternative delivery method is available.",
+            show_alert=True,
+        )
+        return
+
+    # Guard: ResendCodeRequest unavailable (shouldn't happen with Telethon 1.x)
+    if _TLResendCodeRequest is None:
+        await callback.answer(
+            "Resend is not supported by the installed Telethon version.",
+            show_alert=True,
+        )
+        return
+
+    client: TelegramClient = session_data["client"]
+    phone:           str   = session_data["phone"]
+    phone_code_hash: str   = session_data["phone_code_hash"]
+
+    try:
+        new_sent = await client(_TLResendCodeRequest(
+            phone_number=phone,
+            phone_code_hash=phone_code_hash,
+        ))
+        # Update session — old hash is now invalid
+        session_data["phone_code_hash"] = new_sent.phone_code_hash
+        session_data["next_type"]       = getattr(new_sent, "next_type", None)
+        session_data["resent"]          = True   # block further resends
+
+        method_label = _describe_next_type(next_type)
+        logger.info({"event": "otp_resent", "user_id": user_id, "via": method_label})
+
+        try:
+            await callback.message.edit_text(
+                f"📲 **Code resent via {method_label}.**\n\n"
+                "Please send the **verification code** you just received:",
+                parse_mode="Markdown",
+                reply_markup=_cancel_kb(),   # Resend button removed
+            )
+        except TelegramBadRequest:
+            pass
+
+    except FloodWaitError as exc:
+        await callback.answer(
+            f"⏳ Please wait {exc.seconds}s before resending.",
+            show_alert=True,
+        )
+    except Exception as exc:
+        logger.warning({
+            "event": "otp_resend_error",
+            "user_id": user_id,
+            "error": type(exc).__name__,
+        })
+        await callback.answer(
+            "❌ Could not resend code. Please enter the code you received.",
+            show_alert=True,
+        )
 
 
 # ---------------------------------------------------------------------------

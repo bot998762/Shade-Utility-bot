@@ -1409,11 +1409,12 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
         from app.features.session import router as sess_mod
         from unittest.mock import patch, AsyncMock as AM
 
-        # Simulate SentCodeTypeApp by giving result.type any object —
-        # recv_phone no longer inspects it.
+        # Simulate SentCodeTypeApp by naming the class appropriately.
+        # recv_phone no longer blocks on type — it always proceeds.
         fake_result = MagicMock()
         fake_result.phone_code_hash = "hash_app"
-        fake_result.type = MagicMock()          # would be SentCodeTypeApp in prod
+        fake_result.type            = type("SentCodeTypeApp", (), {})()
+        fake_result.next_type       = MagicMock()   # SMS available as next_type
 
         fake_client = MagicMock()
         fake_client.connect    = AM()
@@ -1460,6 +1461,7 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
 
         fake_result = MagicMock()
         fake_result.phone_code_hash = "fakehash123"
+        fake_result.next_type       = None   # no resend available
         fake_client = MagicMock()
         fake_client.connect    = AM()
         fake_client.disconnect = AM()
@@ -1486,8 +1488,383 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
 
         state.set_state.assert_called_with(sess_mod.StringSessionState.waiting_for_otp)
         self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        # next_type=None → no resend button → cancel-only keyboard
+        reply_kwargs = message.reply.call_args[1]
+        markup = reply_kwargs.get("reply_markup")
+        if markup:
+            flat = [b.callback_data for row in markup.inline_keyboard for b in row]
+            self.assertNotIn("ses_otp_resend", flat)
 
         await sess_mod._cleanup_user_session(user_id)
+
+    async def test_recv_phone_stores_next_type_in_session(self):
+        """
+        When send_code_request() returns a next_type, recv_phone stores it
+        in ACTIVE_CLIENTS and includes the Resend button in the keyboard.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM
+
+        # next_type is a CodeTypeSms-like object
+        fake_next_type = MagicMock()
+        fake_next_type.__class__ = type("CodeTypeSms", (), {})
+
+        fake_result = MagicMock()
+        fake_result.phone_code_hash = "hash_with_next"
+        fake_result.next_type       = fake_next_type
+
+        fake_client = MagicMock()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(return_value=fake_result)
+
+        user_id = 70003
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client), \
+             patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+
+            state   = AsyncMock()
+            message = MagicMock()
+            message.from_user    = MagicMock()
+            message.from_user.id = user_id
+            message.chat         = MagicMock()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        # next_type must be stored
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        self.assertIs(
+            sess_mod.ACTIVE_CLIENTS[user_id]["next_type"],
+            fake_next_type,
+        )
+        self.assertFalse(sess_mod.ACTIVE_CLIENTS[user_id]["resent"])
+
+        # Keyboard must contain the ses_otp_resend button
+        reply_kwargs = message.reply.call_args[1]
+        markup = reply_kwargs.get("reply_markup")
+        self.assertIsNotNone(markup)
+        flat = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("ses_otp_resend", flat)
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_recv_phone_handles_phone_number_invalid(self):
+        """
+        PhoneNumberInvalidError from send_code_request must show a clear
+        message and NOT advance to waiting_for_otp (user corrects number).
+        """
+        self._skip_no_telethon()
+        from telethon.errors import PhoneNumberInvalidError
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM
+
+        fake_client = MagicMock()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(
+            side_effect=PhoneNumberInvalidError(None)
+        )
+
+        user_id = 70004
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client), \
+             patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+
+            state   = AsyncMock()
+            message = MagicMock()
+            message.from_user    = MagicMock()
+            message.from_user.id = user_id
+            message.chat         = MagicMock()
+            message.chat.id      = 1
+            message.text         = "+000000"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        # Must NOT advance to OTP
+        state.set_state.assert_not_called()
+        # Must NOT create session entry
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        # Must reply with friendly error
+        message.reply.assert_called_once()
+        reply_text = message.reply.call_args[0][0].lower()
+        self.assertIn("phone number", reply_text)
+
+    # ------------------------------------------------------------------
+    # cb_otp_resend tests
+    # ------------------------------------------------------------------
+
+    async def test_cb_otp_resend_updates_hash_and_sets_resent(self):
+        """
+        cb_otp_resend must call ResendCodeRequest, update phone_code_hash
+        in ACTIVE_CLIENTS, set resent=True, and remove the Resend button.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 73001
+
+        # Mock next_type (CodeTypeSms-like)
+        fake_next_type = MM()
+        fake_next_type.__class__ = type("CodeTypeSms", (), {})
+
+        # Mock ResendCodeRequest response
+        fake_new_sent = MM()
+        fake_new_sent.phone_code_hash = "new_hash_after_resend"
+        fake_new_sent.next_type       = None
+
+        fake_client = MM()
+        fake_client.__call__ = AM(return_value=fake_new_sent)
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "old_hash",
+            "next_type":       fake_next_type,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        callback = MM()
+        callback.from_user    = MM()
+        callback.from_user.id = user_id
+        callback.answer       = AM()
+        callback.message      = MM()
+        callback.message.edit_text = AM()
+
+        with patch("app.features.session.router._TLResendCodeRequest",
+                   return_value=MM()):
+            await sess_mod.cb_otp_resend(callback)
+
+        # phone_code_hash must be updated
+        self.assertEqual(
+            sess_mod.ACTIVE_CLIENTS[user_id]["phone_code_hash"],
+            "new_hash_after_resend",
+        )
+        # resent must be True
+        self.assertTrue(sess_mod.ACTIVE_CLIENTS[user_id]["resent"])
+        # Message must be edited (Resend button removed)
+        callback.message.edit_text.assert_called_once()
+        edited_text = callback.message.edit_text.call_args[0][0]
+        self.assertIn("resent", edited_text.lower())
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_cb_otp_resend_blocked_after_first_use(self):
+        """
+        Clicking Resend a second time must be blocked by the resent=True
+        guard and must NOT call ResendCodeRequest again.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 73002
+
+        fake_client = MM()
+        fake_client.__call__ = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "already_resent_hash",
+            "next_type":       MM(),
+            "resent":          True,   # already used
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        callback = MM()
+        callback.from_user    = MM()
+        callback.from_user.id = user_id
+        callback.answer       = AM()
+
+        with patch("app.features.session.router._TLResendCodeRequest") as mock_req:
+            await sess_mod.cb_otp_resend(callback)
+
+        # ResendCodeRequest must NOT be called
+        mock_req.assert_not_called()
+        fake_client.__call__.assert_not_called()
+        # Must show alert
+        callback.answer.assert_called_once()
+        self.assertTrue(callback.answer.call_args[1].get("show_alert"))
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_cb_otp_resend_flood_wait_handled(self):
+        """FloodWaitError during resend shows a wait-time alert, no crash."""
+        self._skip_no_telethon()
+        from telethon.errors import FloodWaitError
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 73003
+
+        fake_client = MM()
+        flood_exc   = FloodWaitError(None)
+        flood_exc.seconds = 42
+        fake_client.__call__ = AM(side_effect=flood_exc)
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "somehash",
+            "next_type":       MM(),
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        callback = MM()
+        callback.from_user    = MM()
+        callback.from_user.id = user_id
+        callback.answer       = AM()
+
+        with patch("app.features.session.router._TLResendCodeRequest",
+                   return_value=MM()):
+            await sess_mod.cb_otp_resend(callback)
+
+        callback.answer.assert_called_once()
+        alert_text = callback.answer.call_args[0][0]
+        self.assertIn("42", alert_text)
+        self.assertTrue(callback.answer.call_args[1].get("show_alert"))
+        # resent must remain False — resend failed
+        self.assertFalse(sess_mod.ACTIVE_CLIENTS[user_id]["resent"])
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_cb_otp_resend_no_next_type_shows_alert(self):
+        """If next_type is None, Resend must show an alert and do nothing."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 73004
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          MM(),
+            "phone":           "+12025551234",
+            "phone_code_hash": "somehash",
+            "next_type":       None,   # no alternative
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        callback = MM()
+        callback.from_user    = MM()
+        callback.from_user.id = user_id
+        callback.answer       = AM()
+
+        with patch("app.features.session.router._TLResendCodeRequest") as mock_req:
+            await sess_mod.cb_otp_resend(callback)
+
+        mock_req.assert_not_called()
+        callback.answer.assert_called_once()
+        self.assertTrue(callback.answer.call_args[1].get("show_alert"))
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_cb_otp_resend_session_expired(self):
+        """If ACTIVE_CLIENTS has no entry, resend shows expired message."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+        user_id = 73005
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        callback = MM()
+        callback.from_user    = MM()
+        callback.from_user.id = user_id
+        callback.answer       = AM()
+        callback.message      = MM()
+        callback.message.edit_text = AM()
+
+        await sess_mod.cb_otp_resend(callback)
+
+        callback.message.edit_text.assert_called_once()
+        edit_text = callback.message.edit_text.call_args[0][0].lower()
+        self.assertIn("expired", edit_text)
+
+    # ------------------------------------------------------------------
+    # _describe_current_type / _describe_next_type helpers
+    # ------------------------------------------------------------------
+
+    def test_describe_current_type_app(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        result = MagicMock()
+        result.type = type("SentCodeTypeApp", (), {})()
+        self.assertIn("app", sess_mod._describe_current_type(result).lower())
+
+    def test_describe_current_type_sms(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        result = MagicMock()
+        result.type = type("SentCodeTypeSms", (), {})()
+        self.assertIn("sms", sess_mod._describe_current_type(result).lower())
+
+    def test_describe_next_type_sms(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        nt = type("CodeTypeSms", (), {})()
+        self.assertIn("SMS", sess_mod._describe_next_type(nt))
+
+    def test_describe_next_type_call(self):
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        nt = type("CodeTypeCall", (), {})()
+        label = sess_mod._describe_next_type(nt)
+        self.assertTrue("Call" in label or "call" in label.lower())
+
+    def test_otp_input_kb_with_next_type(self):
+        """_otp_input_kb includes ses_otp_resend when next_type is set."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        kb = sess_mod._otp_input_kb(next_type=MagicMock())
+        flat = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertIn("ses_otp_resend", flat)
+        self.assertIn("ses_cancel",     flat)
+
+    def test_otp_input_kb_without_next_type(self):
+        """_otp_input_kb shows only Cancel when next_type is None."""
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+
+        kb = sess_mod._otp_input_kb(next_type=None)
+        flat = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertNotIn("ses_otp_resend", flat)
+        self.assertIn("ses_cancel",        flat)
 
     # ------------------------------------------------------------------
     # recv_otp: PhoneCodeExpiredError mapping
