@@ -1497,6 +1497,278 @@ class TestStringSessionConversationFlow(unittest.IsolatedAsyncioTestCase):
 
         await sess_mod._cleanup_user_session(user_id)
 
+    async def test_recv_phone_diagnostic_log_emitted(self):
+        """
+        recv_phone must emit an otp_code_requested log with user_id,
+        delivery channel, hash_len, and client_id — never the hash itself.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM, call
+        import logging
+
+        fake_result = MM()
+        fake_result.phone_code_hash = "x" * 24   # 24-char hash
+        fake_result.next_type       = None
+        fake_result.type            = type("SentCodeTypeApp", (), {})()
+
+        fake_client = MM()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(return_value=fake_result)
+
+        user_id = 74001
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        logged_events = []
+
+        def capture(data):
+            logged_events.append(data)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client),              patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")),              patch.object(sess_mod.logger, "info", side_effect=capture):
+
+            state   = AsyncMock()
+            message = MM()
+            message.from_user    = MM()
+            message.from_user.id = user_id
+            message.chat         = MM()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        otp_events = [e for e in logged_events if isinstance(e, dict)
+                      and e.get("event") == "otp_code_requested"]
+        self.assertEqual(len(otp_events), 1, "otp_code_requested must be logged once")
+
+        evt = otp_events[0]
+        self.assertEqual(evt["user_id"], user_id)
+        self.assertEqual(evt["hash_len"], 24)     # length only — not the value
+        self.assertIn("client_id", evt)
+        self.assertNotIn("phone", evt)            # phone MUST NOT be logged
+        self.assertNotIn("phone_code_hash", evt)  # hash MUST NOT be logged
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_recv_phone_stale_session_cleaned_before_new_one(self):
+        """
+        If ACTIVE_CLIENTS already has an entry for the user when recv_phone
+        completes, it must be cleaned up before the new session is stored.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        fake_result = MM()
+        fake_result.phone_code_hash = "newhash"
+        fake_result.next_type       = None
+        fake_result.type            = MM()
+
+        new_client = MM()
+        new_client.connect    = AM()
+        new_client.disconnect = AM()
+        new_client.send_code_request = AM(return_value=fake_result)
+
+        # Old stale client already in ACTIVE_CLIENTS
+        old_client = MM()
+        old_client.is_connected = MM(return_value=True)
+        old_client.disconnect   = AM()
+
+        user_id = 74002
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          old_client,
+            "task":            None,
+            "countdown_task":  None,
+            "chat_id":         1,
+            "created_at":      0,
+        }
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=new_client),              patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+
+            state   = AsyncMock()
+            message = MM()
+            message.from_user    = MM()
+            message.from_user.id = user_id
+            message.chat         = MM()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        # Old client must have been disconnected
+        old_client.disconnect.assert_called_once()
+        # New session must be in ACTIVE_CLIENTS with the new client
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        self.assertIs(sess_mod.ACTIVE_CLIENTS[user_id]["client"], new_client)
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_recv_otp_diagnostic_log_emitted(self):
+        """
+        recv_otp must emit otp_sign_in_attempt with hash_len and client_id
+        — never the hash value, phone number, or OTP code itself.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM, patch
+
+        user_id = 74003
+
+        fake_client = MM()
+        fake_client.sign_in      = AM()
+        fake_client.session      = MM()
+        fake_client.session.save = MM(return_value="SESS")
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "y" * 30,
+            "delivery":        "the Telegram app",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        logged_events = []
+        def capture(data):
+            logged_events.append(data)
+
+        state   = AsyncMock()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "12345"
+        message.reply        = AM()
+
+        with patch.object(sess_mod.logger, "info", side_effect=capture):
+            await sess_mod.recv_otp(message, state)
+
+        signin_events = [e for e in logged_events if isinstance(e, dict)
+                         and e.get("event") == "otp_sign_in_attempt"]
+        self.assertEqual(len(signin_events), 1)
+
+        evt = signin_events[0]
+        self.assertEqual(evt["user_id"], user_id)
+        self.assertEqual(evt["hash_len"], 30)
+        self.assertIn("client_id", evt)
+        self.assertNotIn("phone_code_hash", evt)
+        self.assertNotIn("code", evt)
+
+    async def test_recv_otp_disconnected_client_shows_error(self):
+        """
+        If the Telethon client is disconnected when recv_otp is called,
+        it must show a reconnection error and clean up — not crash.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+        user_id = 74004
+
+        fake_client = MM()
+        fake_client.is_connected = MM(return_value=False)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "somehash",
+            "delivery":        "SMS",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = AsyncMock()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "11111"
+        message.reply        = AM()
+
+        await sess_mod.recv_otp(message, state)
+
+        # Session cleaned up
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        state.clear.assert_called_once()
+        # User informed
+        reply_text = message.reply.call_args[0][0].lower()
+        self.assertIn("connection", reply_text)
+
+    async def test_recv_otp_code_rejected_log_has_exception_class(self):
+        """
+        PhoneCodeExpiredError must be logged with event=otp_code_rejected
+        and the exception class name — confirming scenario E is identified.
+        """
+        self._skip_no_telethon()
+        from telethon.errors import PhoneCodeExpiredError
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM, patch
+
+        user_id = 74005
+
+        fake_client = MM()
+        fake_client.sign_in      = AM(side_effect=PhoneCodeExpiredError(None))
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "h" * 20,
+            "delivery":        "the Telegram app",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        logged_warnings = []
+        def capture(data):
+            logged_warnings.append(data)
+
+        state   = AsyncMock()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "30375"
+        message.reply        = AM()
+
+        with patch.object(sess_mod.logger, "warning", side_effect=capture):
+            await sess_mod.recv_otp(message, state)
+
+        warn_events = [e for e in logged_warnings if isinstance(e, dict)
+                       and e.get("event") == "otp_code_rejected"]
+        self.assertEqual(len(warn_events), 1)
+        self.assertEqual(warn_events[0]["exception"], "PhoneCodeExpiredError")
+        self.assertEqual(warn_events[0]["user_id"],   user_id)
+
+        # QR fallback must be offered
+        reply_kwargs = message.reply.call_args[1]
+        markup = reply_kwargs.get("reply_markup")
+        self.assertIsNotNone(markup)
+        flat = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("ses_start_qr", flat)
+
     async def test_recv_phone_stores_next_type_in_session(self):
         """
         When send_code_request() returns a next_type, recv_phone stores it

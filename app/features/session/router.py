@@ -834,6 +834,15 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
     delivery  = _describe_current_type(result)
     next_type = getattr(result, "next_type", None)
 
+    # ── Defensive: discard any stale OTP session for this user ────────────
+    # Normally absent at this point (cmd_string clears on /string), but if
+    # recv_phone is somehow reached while a session already exists (e.g.
+    # on a retry after PhoneNumberInvalidError kept state alive), clean up
+    # the old Telethon client before storing the new one to prevent leaks.
+    if user_id in ACTIVE_CLIENTS:
+        await _cleanup_user_session(user_id)
+    # ─────────────────────────────────────────────────────────────────────
+
     if next_type is not None:
         next_label = _describe_next_type(next_type)
         prompt = (
@@ -848,7 +857,15 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
             f"📨 A verification code has been sent via {delivery}.\n\n"
             "Please send the **verification code**:"
         )
-    # ─────────────────────────────────────────────────────────────────────
+
+    logger.info({
+        "event":        "otp_code_requested",
+        "user_id":      user_id,
+        "delivery":     delivery,
+        "hash_len":     len(result.phone_code_hash),
+        "has_next_type": next_type is not None,
+        "client_id":    id(client),
+    })
 
     ACTIVE_CLIENTS[user_id] = {
         "client":          client,
@@ -856,6 +873,7 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         "method":          "otp",
         "phone":           phone,
         "phone_code_hash": result.phone_code_hash,
+        "delivery":        delivery,    # human-readable delivery channel name
         "next_type":       next_type,   # CodeType* or None
         "resent":          False,       # True after one ResendCode call
         "created_at":      time.monotonic(),
@@ -987,6 +1005,30 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
     phone:           str   = session_data["phone"]
     phone_code_hash: str   = session_data["phone_code_hash"]
 
+    # ── Connectivity guard ────────────────────────────────────────────────
+    # Verify the Telethon client is still connected before calling sign_in.
+    # A disconnected client would raise a connection error rather than an
+    # auth error, which would be confusing to the user.
+    if not client.is_connected():
+        await _cleanup_user_session(user_id)
+        await state.clear()
+        logger.warning({"event": "otp_client_disconnected", "user_id": user_id})
+        await message.reply(
+            "❌ The connection was lost. Please run `/string` again.",
+            parse_mode="Markdown",
+        )
+        return
+    # ─────────────────────────────────────────────────────────────────────
+
+    logger.info({
+        "event":        "otp_sign_in_attempt",
+        "user_id":      user_id,
+        "delivery":     session_data.get("delivery", "unknown"),
+        "hash_len":     len(phone_code_hash),
+        "client_id":    id(client),
+        "resent":       session_data.get("resent", False),
+    })
+
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
 
@@ -1008,15 +1050,22 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
         )
         return
 
-    except PhoneCodeExpiredError:
-        # Raised when Telegram refuses the code — either because it genuinely
-        # timed out, or because it was delivered through the Telegram app and
-        # Telegram's security layer blocks re-entry ("previously shared by
-        # your account").  Both cases map to the same user-facing action:
-        # try QR login.
+    except PhoneCodeExpiredError as exc:
+        # SCENARIO E — Telegram server-side security restriction.
+        # PhoneCodeExpiredError covers two distinct cases:
+        #   1. Code genuinely expired (user waited too long).
+        #   2. Code delivered via Telegram app; Telegram refuses re-entry
+        #      through another session ("previously shared by your account").
+        # Both are indistinguishable at the exception level and both require
+        # the same action: use QR login.  DO NOT attempt to bypass this.
         await _cleanup_user_session(user_id)
         await state.clear()
-        logger.warning({"event": "otp_code_expired_or_shared", "user_id": user_id})
+        logger.warning({
+            "event":     "otp_code_rejected",
+            "user_id":   user_id,
+            "exception": type(exc).__name__,
+            "client_id": id(client),
+        })
         await message.reply(
             "⏱️ **Telegram rejected this verification code.**\n\n"
             "This happens when:\n"
@@ -1042,9 +1091,10 @@ async def recv_otp(message: Message, state: FSMContext) -> None:
         await _cleanup_user_session(user_id)
         await state.clear()
         logger.error({
-            "event": "otp_signin_error",
-            "user_id": user_id,
-            "error": type(exc).__name__,
+            "event":     "otp_signin_error",
+            "user_id":   user_id,
+            "exception": type(exc).__name__,
+            "client_id": id(client),
         })
         await message.reply(
             "❌ Login failed due to an unexpected error.\n"
