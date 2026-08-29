@@ -859,6 +859,17 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
         await _cleanup_user_session(user_id)
     # ─────────────────────────────────────────────────────────────────────
 
+    # ── Build OTP prompt and keyboard based on delivery type ─────────────
+    # Three cases:
+    #   A. Telegram reports an alternative delivery (next_type not None):
+    #      → show "Resend via SMS/Call" button; user can switch delivery
+    #   B. Code delivered via the Telegram app (SentCodeTypeApp), no fallback:
+    #      → warn prominently and offer QR Login NOW, before the user
+    #        enters a code that Telegram will very likely reject as
+    #        "previously shared by your account".  User can still type the
+    #        code — recv_otp handles it — but QR is the right path.
+    #   C. Other delivery (SMS, call, fragment …):
+    #      → plain prompt; code should work normally
     if next_type is not None:
         next_label = _describe_next_type(next_type)
         prompt = (
@@ -868,11 +879,36 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
             f"via {next_label} instead.\n\n"
             "Please send the **verification code**:"
         )
+        keyboard = _otp_input_kb(next_type)
+
+    elif delivery == "the Telegram app":
+        # SentCodeTypeApp with no SMS/Call fallback.
+        # Root cause of "previously shared by your account":
+        #   Telegram delivered the code through the user's own Telegram app
+        #   session, and its security layer refuses to let a NEW Telethon
+        #   client authenticate with a code that travelled through Telegram.
+        #   This is a Telegram server-side policy and cannot be bypassed.
+        #   Offering QR Login immediately prevents wasted attempts.
+        prompt = (
+            "📨 Telegram sent the login code via **the Telegram app**.\n\n"
+            "⚠️ **Important:** Telegram usually rejects codes delivered this "
+            "way when re-entered through another session "
+            "(*previously shared by your account*).\n\n"
+            "👉 **Use QR Login** — it is the reliable option for your account.\n\n"
+            "You may still type the code below if you want to try, but if "
+            "Telegram rejects it, the QR option will reappear."
+        )
+        keyboard = _switch_to_qr_kb()   # "📱 Use QR Login" + "❌ Cancel"
+        # User can still type their OTP — recv_otp handles any text message
+        # in waiting_for_otp state regardless of which keyboard is shown.
+
     else:
         prompt = (
             f"📨 A verification code has been sent via {delivery}.\n\n"
             "Please send the **verification code**:"
         )
+        keyboard = _otp_input_kb(None)
+    # ─────────────────────────────────────────────────────────────────────
 
     logger.info({
         "event":        "otp_code_requested",
@@ -898,7 +934,7 @@ async def recv_phone(message: Message, state: FSMContext) -> None:
     }
 
     await state.set_state(StringSessionState.waiting_for_otp)
-    await message.reply(prompt, parse_mode="Markdown", reply_markup=_otp_input_kb(next_type))
+    await message.reply(prompt, parse_mode="Markdown", reply_markup=keyboard)
 
 
 # ---------------------------------------------------------------------------

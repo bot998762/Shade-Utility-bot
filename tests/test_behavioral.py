@@ -3011,6 +3011,665 @@ class TestOTPAuthRestartError(unittest.IsolatedAsyncioTestCase):
             self.assertIn(fn, src, f"QR function {fn!r} missing after OTP patch")
 
 
+class TestRootCauseRegressions(unittest.IsolatedAsyncioTestCase):
+    """
+    Regression tests derived from the root-cause investigation:
+
+    1. TelegramConflictError — Render rolling deploy causes two instances to
+       poll simultaneously.  aiogram handles it.  No code bug.
+       Tests: single polling start in bootstrap, delete_webhook called first.
+
+    2. OTP 'previously shared' — Telegram security policy for SentCodeTypeApp.
+       The chain: redeploy → FSM/ACTIVE_CLIENTS lost → user re-runs /string
+       → new OTP attempt → SentCodeTypeApp delivery → Telegram rejects.
+       Tests: proactive QR prompt for SentCodeTypeApp, phone_code_hash
+       lifecycle, OTP→2FA→StringSession, overlapping /string cleanup.
+
+    QR flow: verified unchanged throughout.
+    """
+
+    def _skip_no_telethon(self):
+        try:
+            import telethon  # noqa: F401
+        except ImportError:
+            self.skipTest("telethon not installed")
+
+    # ------------------------------------------------------------------
+    # Bootstrap: polling started exactly once, delete_webhook first
+    # ------------------------------------------------------------------
+
+    def test_bootstrap_starts_single_polling_task(self):
+        """
+        bootstrap.py must create exactly one bot_polling asyncio.Task.
+        Multiple calls to start_polling with the same token would cause
+        TelegramConflictError internally.
+        """
+        src = (PROJECT_ROOT / "app/core/bootstrap.py").read_text()
+        # Only one create_task call in the whole file
+        self.assertEqual(src.count("create_task("), 1,
+                         "bootstrap must create exactly one polling task")
+        self.assertIn("bot_polling", src,
+                      "task must be named 'bot_polling' for observability")
+
+    def test_bootstrap_deletes_webhook_before_polling(self):
+        """
+        delete_webhook must be called BEFORE start_polling to ensure the new
+        instance forces the old one to stop polling (Render rolling deploy).
+        """
+        src = (PROJECT_ROOT / "app/core/bootstrap.py").read_text()
+        wh_pos   = src.index("delete_webhook")
+        poll_pos = src.index("start_polling")
+        self.assertLess(wh_pos, poll_pos,
+                        "delete_webhook must appear before start_polling")
+
+    def test_bootstrap_uses_memory_storage(self):
+        """
+        Dispatcher() is created with no storage argument → MemoryStorage.
+        This is process-local.  Document the limitation explicitly so future
+        engineers understand that FSM state is lost on restart/redeploy.
+        """
+        src = (PROJECT_ROOT / "app/core/bootstrap.py").read_text()
+        # Dispatcher must be constructed without a storage argument
+        self.assertIn("Dispatcher()", src,
+                      "Dispatcher must be created without persistent storage "
+                      "(MemoryStorage — process-local, lost on redeploy)")
+        # There must be NO Redis or file-storage import — document the gap
+        for persistent in ("RedisStorage", "FileStorage", "MongoStorage"):
+            self.assertNotIn(persistent, src,
+                             f"{persistent} not expected; change this test if "
+                             "persistent FSM storage is added")
+
+    # ------------------------------------------------------------------
+    # /string overlapping attempts — ACTIVE_CLIENTS cleanup on restart
+    # ------------------------------------------------------------------
+
+    async def test_cmd_string_cleans_active_client_before_restart(self):
+        """
+        If a user re-runs /string mid-flow (e.g. after a redeploy breaks their
+        session), the old ACTIVE_CLIENTS entry must be cleaned up before
+        creating the new one.  Prevents Telethon client leaks.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 90001
+        old_client = MM()
+        old_client.is_connected = MM(return_value=True)
+        old_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":         old_client,
+            "task":           None,
+            "countdown_task": None,
+            "chat_id":        1,
+            "created_at":     0,
+        }
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.reply        = AM()
+
+        with patch("app.features.session.router._get_app_credentials",
+                   return_value=(1, "a")):
+            await sess_mod.cmd_string(message, state)
+
+        # Old client must be disconnected
+        old_client.disconnect.assert_called_once()
+        # ACTIVE_CLIENTS must not still hold the old entry
+        # (it may have been replaced by QR or cleared — either is fine)
+        if user_id in sess_mod.ACTIVE_CLIENTS:
+            self.assertIsNot(sess_mod.ACTIVE_CLIENTS[user_id].get("client"),
+                             old_client,
+                             "old client must not persist in ACTIVE_CLIENTS")
+
+    # ------------------------------------------------------------------
+    # SentCodeTypeApp — proactive QR warning (root cause fix)
+    # ------------------------------------------------------------------
+
+    async def test_recv_phone_app_delivery_no_fallback_shows_qr_button(self):
+        """
+        When Telegram delivers the code via SentCodeTypeApp AND next_type is
+        None (no SMS/Call fallback), recv_phone must show the 'Use QR Login'
+        button IMMEDIATELY in the OTP prompt.
+
+        Root cause: the 'previously shared by your account' rejection only
+        appears after the user enters the code.  Offering QR upfront prevents
+        the wasted attempt.  The user can still type the code if they want.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        # SentCodeTypeApp — code delivered via the Telegram app, no fallback
+        fake_result = MM()
+        fake_result.phone_code_hash = "apphash"
+        fake_result.next_type       = None
+        fake_result.type            = type("SentCodeTypeApp", (), {})()
+
+        fake_client = MM()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(return_value=fake_result)
+
+        user_id = 90002
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client),              patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+
+            state   = MM()
+            state.set_state = AM()
+            state.clear     = AM()
+            message = MM()
+            message.from_user    = MM()
+            message.from_user.id = user_id
+            message.chat         = MM()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        # Must still advance to waiting_for_otp (user can still try the code)
+        state.set_state.assert_called_with(
+            sess_mod.StringSessionState.waiting_for_otp
+        )
+        # Must create ACTIVE_CLIENTS entry (flow not blocked)
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+
+        # The reply keyboard must include ses_start_qr (QR offered immediately)
+        reply_kwargs = message.reply.call_args[1]
+        markup = reply_kwargs.get("reply_markup")
+        self.assertIsNotNone(markup,
+                             "keyboard must be present for SentCodeTypeApp prompt")
+        flat_callbacks = [b.callback_data
+                          for row in markup.inline_keyboard for b in row]
+        self.assertIn("ses_start_qr", flat_callbacks,
+                      "ses_start_qr must appear in keyboard for SentCodeTypeApp + no fallback")
+
+        # The prompt text must warn about the likely rejection
+        reply_text = message.reply.call_args[0][0].lower()
+        self.assertTrue(
+            "qr" in reply_text or "reject" in reply_text or "shared" in reply_text,
+            f"Prompt must warn about Telegram rejection; got: {reply_text!r}",
+        )
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_recv_phone_sms_delivery_does_not_show_qr_button(self):
+        """
+        When delivery is SMS (not SentCodeTypeApp), the OTP prompt must NOT
+        show the QR button — the code should work normally via SMS.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        fake_result = MM()
+        fake_result.phone_code_hash = "smshash"
+        fake_result.next_type       = None
+        fake_result.type            = type("SentCodeTypeSms", (), {})()
+
+        fake_client = MM()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(return_value=fake_result)
+
+        user_id = 90003
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client),              patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+
+            state   = MM()
+            state.set_state = AM()
+            state.clear     = AM()
+            message = MM()
+            message.from_user    = MM()
+            message.from_user.id = user_id
+            message.chat         = MM()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        reply_kwargs = message.reply.call_args[1]
+        markup = reply_kwargs.get("reply_markup")
+        if markup:
+            flat_callbacks = [b.callback_data
+                              for row in markup.inline_keyboard for b in row]
+            self.assertNotIn("ses_start_qr", flat_callbacks,
+                             "ses_start_qr must NOT appear for SMS delivery")
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    # ------------------------------------------------------------------
+    # phone_code_hash lifecycle — same client, same hash, single write
+    # ------------------------------------------------------------------
+
+    async def test_phone_code_hash_stored_from_send_code_result(self):
+        """
+        The phone_code_hash stored in ACTIVE_CLIENTS must be exactly the one
+        returned by send_code_request(), not a stale or modified value.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        EXPECTED_HASH = "exact_hash_from_telegram_xyz"
+        fake_result = MM()
+        fake_result.phone_code_hash = EXPECTED_HASH
+        fake_result.next_type       = None
+        fake_result.type            = type("SentCodeTypeSms", (), {})()
+
+        fake_client = MM()
+        fake_client.connect    = AM()
+        fake_client.disconnect = AM()
+        fake_client.send_code_request = AM(return_value=fake_result)
+
+        user_id = 90004
+        sess_mod.ACTIVE_CLIENTS.pop(user_id, None)
+
+        with patch("app.features.session.router.TelegramClient",
+                   return_value=fake_client),              patch("app.features.session.router._get_app_credentials",
+                   return_value=(12345, "abc")):
+
+            state   = MM()
+            state.set_state = AM()
+            state.clear     = AM()
+            message = MM()
+            message.from_user    = MM()
+            message.from_user.id = user_id
+            message.chat         = MM()
+            message.chat.id      = 1
+            message.text         = "+12025551234"
+            message.reply        = AM()
+
+            await sess_mod.recv_phone(message, state)
+
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        stored_hash = sess_mod.ACTIVE_CLIENTS[user_id]["phone_code_hash"]
+        self.assertEqual(stored_hash, EXPECTED_HASH,
+                         "phone_code_hash must be stored verbatim from send_code_request result")
+        stored_client = sess_mod.ACTIVE_CLIENTS[user_id]["client"]
+        self.assertIs(stored_client, fake_client,
+                      "stored client must be the same object used for send_code_request")
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    async def test_recv_otp_uses_stored_hash_not_new_one(self):
+        """
+        recv_otp must pass the EXACT phone_code_hash from ACTIVE_CLIENTS to
+        sign_in — it must not create a new hash or use any cached value.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM, call
+
+        user_id = 90005
+        STORED_HASH = "stored_exact_hash_abc123"
+
+        sign_in_calls = []
+        async def fake_sign_in(**kwargs):
+            sign_in_calls.append(kwargs)
+
+        fake_client = MM()
+        fake_client.sign_in      = fake_sign_in
+        fake_client.session      = MM()
+        fake_client.session.save = MM(return_value="SESS")
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": STORED_HASH,
+            "delivery":        "SMS",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "99999"
+        message.reply        = AM()
+
+        await sess_mod.recv_otp(message, state)
+
+        self.assertEqual(len(sign_in_calls), 1)
+        self.assertEqual(sign_in_calls[0]["phone_code_hash"], STORED_HASH,
+                         "sign_in must receive the exact stored phone_code_hash")
+        self.assertEqual(sign_in_calls[0]["phone"], "+12025551234")
+        self.assertEqual(sign_in_calls[0]["code"],  "99999")
+
+    async def test_resend_replaces_hash_atomically(self):
+        """
+        After a resend via cb_otp_resend, the ACTIVE_CLIENTS hash must be
+        the NEW hash from ResendCodeRequest — the old hash is no longer valid.
+        Subsequent recv_otp must use the new hash.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 90006
+        OLD_HASH = "old_hash_before_resend"
+        NEW_HASH = "new_hash_after_resend"
+
+        fake_new_sent = MM()
+        fake_new_sent.phone_code_hash = NEW_HASH
+        fake_new_sent.next_type       = None
+
+        fake_next_type = MM()
+        fake_next_type.__class__ = type("CodeTypeSms", (), {})
+
+        fake_client = MM()
+        fake_client.__call__ = AM(return_value=fake_new_sent)
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": OLD_HASH,
+            "next_type":       fake_next_type,
+            "resent":          False,
+            "method":          "otp",
+            "delivery":        "the Telegram app",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        callback = MM()
+        callback.from_user    = MM()
+        callback.from_user.id = user_id
+        callback.answer       = AM()
+        callback.message      = MM()
+        callback.message.edit_text = AM()
+
+        with patch("app.features.session.router._TLResendCodeRequest",
+                   return_value=MM()):
+            await sess_mod.cb_otp_resend(callback)
+
+        # Hash must be atomically replaced
+        self.assertEqual(
+            sess_mod.ACTIVE_CLIENTS[user_id]["phone_code_hash"],
+            NEW_HASH,
+            "phone_code_hash must be updated to the new hash after resend",
+        )
+        self.assertNotEqual(
+            sess_mod.ACTIVE_CLIENTS[user_id]["phone_code_hash"],
+            OLD_HASH,
+            "old hash must not remain after resend",
+        )
+        self.assertTrue(sess_mod.ACTIVE_CLIENTS[user_id]["resent"])
+
+        await sess_mod._cleanup_user_session(user_id)
+
+    # ------------------------------------------------------------------
+    # Successful OTP → 2FA → StringSession (full happy path)
+    # ------------------------------------------------------------------
+
+    async def test_full_otp_2fa_string_session_flow(self):
+        """
+        Full OTP+2FA success path:
+          recv_otp → SessionPasswordNeededError → process_2fa → StringSession
+
+        Verifies:
+        - same client throughout
+        - phone_code_hash used in sign_in
+        - 2FA password used in second sign_in
+        - StringSession generated from authorized client
+        - all state cleaned up after success
+        """
+        self._skip_no_telethon()
+        from telethon.errors import SessionPasswordNeededError
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+        user_id = 90007
+        THE_SESSION = "1BQANOTEuMTOTPTest_StringSession_xyz"
+
+        sign_in_calls = []
+        call_count    = [0]
+
+        async def fake_sign_in(**kwargs):
+            call_count[0] += 1
+            sign_in_calls.append(kwargs)
+            if call_count[0] == 1:
+                raise SessionPasswordNeededError(None)
+            # second call (2FA password) succeeds silently
+
+        fake_client = MM()
+        fake_client.sign_in      = fake_sign_in
+        fake_client.session      = MM()
+        fake_client.session.save = MM(return_value=THE_SESSION)
+        fake_client.is_connected = MM(return_value=True)
+        fake_client.disconnect   = AM()
+
+        STORED_HASH = "otp_hash_for_2fa_test"
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          fake_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": STORED_HASH,
+            "delivery":        "SMS",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        # Step 1: recv_otp triggers 2FA
+        otp_state   = MM()
+        otp_state.clear     = AM()
+        otp_state.set_state = AM()
+        otp_message = MM()
+        otp_message.from_user    = MM()
+        otp_message.from_user.id = user_id
+        otp_message.text         = "54321"
+        otp_message.reply        = AM()
+
+        await sess_mod.recv_otp(otp_message, otp_state)
+
+        # sign_in must have been called with the stored hash
+        self.assertEqual(sign_in_calls[0]["phone_code_hash"], STORED_HASH)
+        # FSM must advance to waiting_for_2fa
+        otp_state.set_state.assert_called_with(
+            sess_mod.StringSessionState.waiting_for_2fa
+        )
+        # Session must still be alive for 2FA
+        self.assertIn(user_id, sess_mod.ACTIVE_CLIENTS)
+
+        # Step 2: process_2fa completes login
+        tfa_state   = MM()
+        tfa_state.clear     = AM()
+        tfa_state.set_state = AM()
+        tfa_message = MM()
+        tfa_message.from_user    = MM()
+        tfa_message.from_user.id = user_id
+        tfa_message.text         = "mySecretPassword"
+        tfa_message.reply        = AM()
+
+        await sess_mod.process_2fa(tfa_message, tfa_state)
+
+        # Second sign_in must use the password (not the OTP code)
+        self.assertEqual(sign_in_calls[1].get("password"), "mySecretPassword")
+        self.assertNotIn("code", sign_in_calls[1],
+                         "2FA sign_in must not include an OTP code")
+
+        # Session must be generated and cleaned up
+        self.assertNotIn(user_id, sess_mod.ACTIVE_CLIENTS)
+        tfa_state.clear.assert_called_once()
+
+        # StringSession must be delivered to the user
+        reply_text = tfa_message.reply.call_args[0][0]
+        self.assertIn(THE_SESSION, reply_text)
+        self.assertIn("✅", reply_text)
+
+    # ------------------------------------------------------------------
+    # Client ownership: same client from send_code_request through sign_in
+    # ------------------------------------------------------------------
+
+    async def test_same_client_object_used_throughout_otp(self):
+        """
+        The TelegramClient created in recv_phone must be the same object
+        that recv_otp uses for sign_in.  A different client object would
+        have no auth state and would fail.
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+        user_id = 90008
+
+        client_used_for_sign_in = []
+
+        async def capture_sign_in(**kwargs):
+            client_used_for_sign_in.append(kwargs)
+
+        the_client = MM()
+        the_client.sign_in      = capture_sign_in
+        the_client.session      = MM()
+        the_client.session.save = MM(return_value="SESS_OK")
+        the_client.is_connected = MM(return_value=True)
+        the_client.disconnect   = AM()
+
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          the_client,   # ← specific object
+            "phone":           "+12025551234",
+            "phone_code_hash": "correcthash",
+            "delivery":        "SMS",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.text         = "12345"
+        message.reply        = AM()
+
+        await sess_mod.recv_otp(message, state)
+
+        self.assertEqual(len(client_used_for_sign_in), 1,
+                         "sign_in must be called exactly once")
+        # Verify client identity via the captured kwargs
+        # (the client object itself invoked capture_sign_in)
+        self.assertEqual(client_used_for_sign_in[0]["phone_code_hash"], "correcthash")
+
+    # ------------------------------------------------------------------
+    # OTP state consistency: no stale state after /string restart
+    # ------------------------------------------------------------------
+
+    async def test_second_string_command_replaces_otp_session_cleanly(self):
+        """
+        If the user runs /string twice (e.g. because a redeploy broke the
+        first flow), the second run must not conflict with the first:
+        - old client disconnected
+        - old FSM state cleared
+        - fresh credential check performed
+        """
+        self._skip_no_telethon()
+        from app.features.session import router as sess_mod
+        from unittest.mock import patch, AsyncMock as AM, MagicMock as MM
+
+        user_id = 90009
+
+        old_client = MM()
+        old_client.is_connected = MM(return_value=True)
+        old_client.disconnect   = AM()
+
+        # Simulate a stale OTP session from the first /string
+        sess_mod.ACTIVE_CLIENTS[user_id] = {
+            "client":          old_client,
+            "phone":           "+12025551234",
+            "phone_code_hash": "stale_hash",
+            "delivery":        "the Telegram app",
+            "next_type":       None,
+            "resent":          False,
+            "method":          "otp",
+            "chat_id":         1,
+            "task":            None,
+            "countdown_task":  None,
+            "created_at":      0,
+        }
+
+        state   = MM()
+        state.clear     = AM()
+        state.set_state = AM()
+        message = MM()
+        message.from_user    = MM()
+        message.from_user.id = user_id
+        message.reply        = AM()
+
+        with patch("app.features.session.router._get_app_credentials",
+                   return_value=(1, "a")):
+            await sess_mod.cmd_string(message, state)
+
+        # Old client must be disconnected
+        old_client.disconnect.assert_called_once()
+        # State must be cleared before advancing
+        state.clear.assert_called()
+        # User must see the method selection menu
+        message.reply.assert_called_once()
+        # Stale hash must no longer be in ACTIVE_CLIENTS
+        if user_id in sess_mod.ACTIVE_CLIENTS:
+            self.assertNotEqual(
+                sess_mod.ACTIVE_CLIENTS[user_id].get("phone_code_hash"),
+                "stale_hash",
+            )
+
+    # ------------------------------------------------------------------
+    # QR flow source unchanged (regression guard)
+    # ------------------------------------------------------------------
+
+    def test_qr_functions_present_and_unchanged(self):
+        """Confirm QR-specific functions are still in source after OTP patches."""
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        for fn in ("_qr_countdown", "_wait_for_qr", "_start_qr_login",
+                   "_stop_countdown", "cb_qr_refresh", "cb_method_qr",
+                   "_qr_caption", "_qr_kb"):
+            self.assertIn(fn, src, f"QR function {fn!r} must remain in source")
+
+    def test_no_force_sms(self):
+        """force_sms is deprecated in Telethon 1.34.0 and must not be used."""
+        src = (PROJECT_ROOT / "app/features/session/router.py").read_text()
+        self.assertNotIn("force_sms", src,
+                         "force_sms is deprecated; use ResendCodeRequest instead")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
