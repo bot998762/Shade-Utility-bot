@@ -165,6 +165,11 @@ class ApplicationBootstrap:
 
         # 2. Clean up Telethon sessions
         try:
+            from app.features.session_manager.router import shutdown_all_sm_sessions
+            await shutdown_all_sm_sessions()
+        except Exception as exc:
+            logger.warning({"event": "sm_shutdown_error", "error": str(exc)})
+        try:
             from app.features.session.router import shutdown_all_sessions
             await shutdown_all_sessions()
         except Exception as exc:

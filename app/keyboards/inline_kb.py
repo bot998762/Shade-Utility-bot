@@ -12,6 +12,9 @@ def main_menu_kb(bot_username: str = "ShadeUtilityBot"):
             InlineKeyboardButton(text="🌐 Web & Utilities", callback_data="cat_web")
         ],
         [
+            InlineKeyboardButton(text="🔐 Session Manager", callback_data="cat_session_mgr")
+        ],
+        [
             InlineKeyboardButton(text="📘 Full Manual (/help)", callback_data="menu_help")
         ],
         [

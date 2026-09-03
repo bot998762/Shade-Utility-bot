@@ -32,7 +32,9 @@ HELP_MANUAL_TEXT = """📖 **SHADE UTILITY — ADVANCED USER MANUAL**
 • `/jsonfmt <json_str>` ➔ Validate and pretty-print raw JSON payload.
 
 🔑 **TELEGRAM AUTHENTICATION**
-• `/string <api_id> <api_hash>` ➔ Generate Telethon String Session via QR login.
+• `/string` ➔ Generate Telethon String Session (QR / OTP login).
+• `/create_session` ➔ Authenticate and export a `.session` file.
+• `/login_session` ➔ Upload and validate an existing `.session` file.
 
 📸 **MEDIA & OCR TOOLS**
 • Reply photo with `/ocr` ➔ Extract text using multi-engine OCR failover.

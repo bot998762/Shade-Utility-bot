@@ -27,6 +27,7 @@ FEATURE_MODULES = [
     "app.features.crypto.router",
     "app.features.media.router",
     "app.features.session.router",
+    "app.features.session_manager.router",
     "app.features.admin.router",
 ]
 
