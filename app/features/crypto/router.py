@@ -1,3 +1,4 @@
+import html as _html
 from aiogram import Router
 from aiogram.types import Message
 from aiogram.filters import Command
@@ -26,13 +27,19 @@ async def cmd_hash(message: Message):
     if len(args) < 2:
         await message.reply("❌ **Usage:** `/hash <text>`", parse_mode="Markdown")
         return
-    md5_val, sha256_val, sha512_val = crypto.gen_hashes(args[1])
+    md5_val, sha256_val, sha512_val, \
+    sha3_224_val, sha3_256_val, sha3_384_val, sha3_512_val, \
+    blake2b_val, blake2s_val = crypto.gen_hashes(args[1])
     await message.reply(
         f"🔐 **Cryptographic Hash Digest**\n"
         f"───────────────────────────\n"
         f"• **MD5:**\n`{md5_val}`\n\n"
         f"• **SHA-256:**\n`{sha256_val}`\n\n"
-        f"• **SHA-512:**\n`{sha512_val}`\n"
+        f"• **SHA-512:**\n`{sha512_val}`\n\n"
+        f"• **SHA3-256:**\n`{sha3_256_val}`\n\n"
+        f"• **SHA3-512:**\n`{sha3_512_val}`\n\n"
+        f"• **BLAKE2b:**\n`{blake2b_val}`\n\n"
+        f"• **BLAKE2s:**\n`{blake2s_val}`\n"
         f"───────────────────────────",
         parse_mode="Markdown"
     )
@@ -49,12 +56,16 @@ async def cmd_b64en(message: Message):
 async def cmd_b64de(message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("❌ **Usage:** `/b64de <string>`", parse_mode="Markdown")
+        await message.reply("❌ <b>Usage:</b> <code>/b64de &lt;string&gt;</code>", parse_mode="HTML")
         return
     try:
-        await message.reply(f"🔡 **Base64 Decoded:**\n`{crypto.b64_decode(args[1])}`", parse_mode="Markdown")
+        decoded = crypto.b64_decode(args[1])
+        await message.reply(
+            f"🔡 <b>Base64 Decoded:</b>\n<code>{_html.escape(decoded)}</code>",
+            parse_mode="HTML",
+        )
     except Exception:
-        await message.reply("❌ **Error:** Invalid Base64 string payload.", parse_mode="Markdown")
+        await message.reply("❌ <b>Error:</b> Invalid Base64 string payload.", parse_mode="HTML")
 
 @router.message(Command("time"))
 async def cmd_time(message: Message):

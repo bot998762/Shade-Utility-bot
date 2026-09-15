@@ -15,6 +15,7 @@ import html as _html
 from aiogram import Router, Bot
 from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import Command
+from qrcode.exceptions import DataOverflowError as QRDataOverflowError
 from app.platform.capability import FeatureManifest, CapabilityRegistry
 from app.services.ocr_service import OCRService
 from app.services.shortener_service import ShortenerService
@@ -116,7 +117,15 @@ async def cmd_qr(message: Message) -> None:
         )
         return
     content = args[1]
-    bio = qr.generate_qr_buffer(content)
+    try:
+        bio = qr.generate_qr_buffer(content)
+    except QRDataOverflowError:
+        await message.reply(
+            "❌ <b>Data too large for QR code.</b>\n"
+            "QR codes support up to ~2,900 bytes. Please shorten the text and try again.",
+            parse_mode="HTML",
+        )
+        return
     try:
         input_file = BufferedInputFile(bio.getvalue(), filename="qrcode.png")
         # User-supplied QR content can contain any characters — escape for HTML caption

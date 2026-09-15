@@ -21,11 +21,12 @@ HELP_MANUAL_TEXT = """📖 **SHADE UTILITY — ADVANCED USER MANUAL**
 
 ⚙️ **DEVELOPER & CRYPTO TOOLS**
 • `/epoch <timestamp|date>` ➔ Convert Unix timestamp to ISO UTC or vice versa.
+• `/time` ➔ Return current Unix epoch timestamp instantly.
 • `/urlen <text>` ➔ Percent-encode string for safe URL query transmission.
 • `/urlde <text>` ➔ Decode percent-encoded URL string back to plain text.
 • `/b64en <text>` ➔ Convert string to standard Base64 representation.
 • `/b64de <string>` ➔ Decode Base64 encoded payload back to plain text.
-• `/hash <text>` ➔ Calculate MD5, SHA-256, and SHA-512 hashes simultaneously.
+• `/hash <text>` ➔ Calculate MD5, SHA-256, SHA-512, SHA3-256, SHA3-512, BLAKE2b, BLAKE2s hashes.
 • `/password [length]` ➔ Generate high-entropy cryptographic password (8-64 chars).
 • `/checkpwd <password>` ➔ Evaluate entropy score and character complexity.
 • `/uuid` ➔ Generate a cryptographically secure random UUIDv4 string.
@@ -80,11 +81,12 @@ async def handle_dev_cat(call: CallbackQuery) -> None:
         "🛠️ **DEVELOPER & CRYPTO UTILITIES**\n"
         "───────────────────────────\n"
         "⏰ `/epoch <time>` ➔ Timestamp / ISO Date Converter\n"
+        "🕐 `/time` ➔ Current Unix Epoch Timestamp\n"
         "🔗 `/urlen <text>` ➔ URL Encoder\n"
         "🔓 `/urlde <text>` ➔ URL Decoder\n"
         "🔢 `/b64en <text>` ➔ Base64 Encoder\n"
         "🔡 `/b64de <text>` ➔ Base64 Decoder\n"
-        "🔐 `/hash <text>` ➔ MD5, SHA256 & SHA512 Hashes\n"
+        "🔐 `/hash <text>` ➔ MD5, SHA-256/512, SHA3-256/512, BLAKE2b/s Hashes\n"
         "🔑 `/password [len]` ➔ Secure Password Generator\n"
         "🛡️ `/checkpwd <pwd>` ➔ Password Complexity Inspector\n"
         "🆔 `/uuid` ➔ Generate Random UUIDv4\n"
@@ -100,10 +102,10 @@ async def handle_session_cat(call: CallbackQuery) -> None:
     msg = (
         "🔑 **TELEGRAM STRING SESSION GENERATOR**\n"
         "───────────────────────────\n"
-        "Generate a String Session for Telethon via QR login.\n\n"
+        "Generate a Telethon StringSession via interactive QR or OTP login.\n\n"
         "📌 **Usage:**\n"
-        "`/string <API_ID> <API_HASH>`\n\n"
-        "💡 Get credentials at https://my.telegram.org\n"
+        "`/string` — no arguments required\n\n"
+        "Follow the on-screen prompts to authenticate with your Telegram account.\n"
         "───────────────────────────"
     )
     await call.message.edit_text(msg, reply_markup=category_dev_kb(), parse_mode="Markdown")
@@ -208,10 +210,14 @@ async def cmd_urlen(message: Message) -> None:
 async def cmd_urlde(message: Message) -> None:
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("❌ **Usage:** `/urlde <text>`", parse_mode="Markdown")
+        await message.reply("❌ <b>Usage:</b> <code>/urlde &lt;text&gt;</code>", parse_mode="HTML")
         return
     decoded = crypto.url_decode(args[1])
-    await message.reply(f"🔓 **URL Decoded Output:**\n`{decoded}`", parse_mode="Markdown")
+    import html as _html
+    await message.reply(
+        f"🔓 <b>URL Decoded Output:</b>\n<code>{_html.escape(decoded)}</code>",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("checkpwd"))

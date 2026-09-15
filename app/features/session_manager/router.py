@@ -1164,25 +1164,26 @@ async def ls_recv_file(message: Message, state: FSMContext, bot: Bot) -> None:
             raise inner
 
         # Show safe non-sensitive account summary
+        import html as _html
         parts = [me.first_name or ""]
         if me.last_name:
             parts.append(me.last_name)
-        full_name = " ".join(parts).strip() or "Unknown"
-        uname   = f"@{me.username}" if me.username else "No username"
+        full_name = _html.escape(" ".join(parts).strip() or "Unknown")
+        uname   = _html.escape(f"@{me.username}") if me.username else "No username"
         premium = "✅ Premium" if getattr(me, "is_premium", False) else "Standard"
         bot_tag = "🤖 Bot" if me.bot else "👤 User"
 
         await status.edit_text(
-            "✅ **Session loaded successfully!**\n"
+            "✅ <b>Session loaded successfully!</b>\n"
             "────────────────────\n"
-            f"👤 **Name:** {full_name}\n"
-            f"📛 **Username:** {uname}\n"
-            f"🆔 **User ID:** `{me.id}`\n"
-            f"🌟 **Tier:** {premium}\n"
-            f"🏷️ **Type:** {bot_tag}\n"
+            f"👤 <b>Name:</b> {full_name}\n"
+            f"📛 <b>Username:</b> {uname}\n"
+            f"🆔 <b>User ID:</b> <code>{me.id}</code>\n"
+            f"🌟 <b>Tier:</b> {premium}\n"
+            f"🏷️ <b>Type:</b> {bot_tag}\n"
             "────────────────────\n"
             "The session is authorized and valid.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         logger.info({"event": "sm_session_validated", "user_id": user_id})
         await state.clear()

@@ -196,11 +196,37 @@ class TestFeatureLoaderIsolation(unittest.TestCase):
 # ───────────────────────────────────────────────────────────────
 @needs_aiohttp
 class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
+    """
+    Tests for the health / readiness endpoints in app.core.health.
+
+    set_ready() stores LIVE object references (bot_task, http_session).
+    readiness_handler() calls bot_task.done() and http_session.closed on
+    every request, so mocks must reflect those live properties correctly.
+    """
+
+    def _make_live_task(self, done: bool = False) -> MagicMock:
+        """Return a mock asyncio.Task whose .done() returns the given bool."""
+        t = MagicMock()
+        t.done.return_value = done
+        return t
+
+    def _make_live_session(self, closed: bool = False) -> MagicMock:
+        """Return a mock aiohttp.ClientSession whose .closed returns the given bool."""
+        s = MagicMock()
+        s.closed = closed
+        return s
+
     def _reset(self):
+        """Reset _readiness to its initial not-ready state using the actual dict keys."""
         from app.core import health
         health._readiness.update({
-            "ready": False, "bot_task_ok": False, "http_session_ok": False,
-            "features_loaded": 0, "start_time": None, "degraded_features": [],
+            "ready": False,
+            "bot_task": None,
+            "http_session": None,
+            "features_loaded": 0,
+            "start_time": None,
+            "degraded_features": [],
+            "shutdown_reason": None,
         })
         return health
 
@@ -216,20 +242,35 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
 
     async def test_readiness_200_after_set_ready(self):
         h = self._reset()
-        h.set_ready(bot_task_ok=True, http_session_ok=True, features_loaded=5, degraded_features=[])
+        h.set_ready(
+            bot_task=self._make_live_task(done=False),
+            http_session=self._make_live_session(closed=False),
+            features_loaded=5,
+            degraded_features=[],
+        )
         resp = await h.readiness_handler(MagicMock())
         self.assertEqual(resp.status, 200)
 
     async def test_readiness_503_when_bot_task_dead(self):
         h = self._reset()
-        h.set_ready(bot_task_ok=False, http_session_ok=True, features_loaded=5, degraded_features=[])
+        h.set_ready(
+            bot_task=self._make_live_task(done=True),   # task has finished → unhealthy
+            http_session=self._make_live_session(closed=False),
+            features_loaded=5,
+            degraded_features=[],
+        )
         resp = await h.readiness_handler(MagicMock())
         self.assertEqual(resp.status, 503)
 
     async def test_degraded_status_with_failed_features(self):
         import json as _json
         h = self._reset()
-        h.set_ready(bot_task_ok=True, http_session_ok=True, features_loaded=4, degraded_features=["X"])
+        h.set_ready(
+            bot_task=self._make_live_task(done=False),
+            http_session=self._make_live_session(closed=False),
+            features_loaded=4,
+            degraded_features=["X"],
+        )
         resp = await h.readiness_handler(MagicMock())
         self.assertEqual(resp.status, 200)
         body = _json.loads(resp.body)
@@ -237,7 +278,12 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
 
     async def test_set_not_ready_returns_503(self):
         h = self._reset()
-        h.set_ready(bot_task_ok=True, http_session_ok=True, features_loaded=5, degraded_features=[])
+        h.set_ready(
+            bot_task=self._make_live_task(done=False),
+            http_session=self._make_live_session(closed=False),
+            features_loaded=5,
+            degraded_features=[],
+        )
         h.set_not_ready("shutdown")
         resp = await h.readiness_handler(MagicMock())
         self.assertEqual(resp.status, 503)
@@ -377,10 +423,74 @@ class TestCryptoUtils(unittest.TestCase):
         self.assertEqual(self.c.url_decode(self.c.url_encode(s)), s)
 
     def test_hash_known_values(self):
-        md5, sha256, sha512 = self.c.gen_hashes("test")
+        result = self.c.gen_hashes("test")
+        md5, sha256, sha512, sha3_224, sha3_256, sha3_384, sha3_512, blake2b, blake2s = result
+        # Existing algorithms — values must remain identical to the pre-Phase-2A baseline
         self.assertEqual(md5, "098f6bcd4621d373cade4e832627b4f6")
         self.assertEqual(len(sha256), 64)
         self.assertEqual(len(sha512), 128)
+
+    def test_hash_returns_nine_values(self):
+        """gen_hashes must return exactly 9 values (3 original + 4 SHA-3 + 2 BLAKE2)."""
+        result = self.c.gen_hashes("test")
+        self.assertEqual(len(result), 9)
+
+    def test_sha3_224_known_vector(self):
+        _, _, _, sha3_224, _, _, _, _, _ = self.c.gen_hashes("test")
+        self.assertEqual(sha3_224, "3797bf0afbbfca4a7bbba7602a2b552746876517a7f9b7ce2db0ae7b")
+        self.assertEqual(len(sha3_224), 56)
+
+    def test_sha3_256_known_vector(self):
+        _, _, _, _, sha3_256, _, _, _, _ = self.c.gen_hashes("test")
+        self.assertEqual(sha3_256, "36f028580bb02cc8272a9a020f4200e346e276ae664e45ee80745574e2f5ab80")
+        self.assertEqual(len(sha3_256), 64)
+
+    def test_sha3_384_known_vector(self):
+        _, _, _, _, _, sha3_384, _, _, _ = self.c.gen_hashes("test")
+        self.assertEqual(sha3_384, "e516dabb23b6e30026863543282780a3ae0dccf05551cf0295178d7ff0f1b41eecb9db3ff219007c4e097260d58621bd")
+        self.assertEqual(len(sha3_384), 96)
+
+    def test_sha3_512_known_vector(self):
+        _, _, _, _, _, _, sha3_512, _, _ = self.c.gen_hashes("test")
+        self.assertEqual(sha3_512, "9ece086e9bac491fac5c1d1046ca11d737b92a2b2ebd93f005d7b710110c0a678288166e7fbe796883a4f2e9b3ca9f484f521d0ce464345cc1aec96779149c14")
+        self.assertEqual(len(sha3_512), 128)
+
+    def test_blake2b_known_vector(self):
+        _, _, _, _, _, _, _, blake2b, _ = self.c.gen_hashes("test")
+        self.assertEqual(blake2b, "a71079d42853dea26e453004338670a53814b78137ffbed07603a41d76a483aa9bc33b582f77d30a65e6f29a896c0411f38312e1d66e0bf16386c86a89bea572")
+        self.assertEqual(len(blake2b), 128)
+
+    def test_blake2s_known_vector(self):
+        _, _, _, _, _, _, _, _, blake2s = self.c.gen_hashes("test")
+        self.assertEqual(blake2s, "f308fc02ce9172ad02a7d75800ecfc027109bc67987ea32aba9b8dcc7b10150e")
+        self.assertEqual(len(blake2s), 64)
+
+    def test_hash_empty_string(self):
+        """gen_hashes must handle empty string without exception."""
+        import hashlib
+        result = self.c.gen_hashes("")
+        self.assertEqual(len(result), 9)
+        # MD5 of empty string is a known constant
+        self.assertEqual(result[0], "d41d8cd98f00b204e9800998ecf8427e")
+
+    def test_hash_all_hex_output(self):
+        """All 9 returned values must be valid lowercase hex strings."""
+        import re
+        for digest in self.c.gen_hashes("hello"):
+            self.assertRegex(digest, r'^[0-9a-f]+$', f"Not valid hex: {digest}")
+
+    def test_existing_md5_unchanged(self):
+        """MD5 of 'test' must still be the exact pre-Phase-2A value."""
+        md5 = self.c.gen_hashes("test")[0]
+        self.assertEqual(md5, "098f6bcd4621d373cade4e832627b4f6")
+
+    def test_existing_sha256_length_unchanged(self):
+        """SHA-256 digest must still be 64 hex chars."""
+        self.assertEqual(len(self.c.gen_hashes("test")[1]), 64)
+
+    def test_existing_sha512_length_unchanged(self):
+        """SHA-512 digest must still be 128 hex chars."""
+        self.assertEqual(len(self.c.gen_hashes("test")[2]), 128)
 
     def test_strength_weak(self):
         self.assertIn("Weak", self.c.check_password_strength("abc"))
@@ -402,8 +512,161 @@ class TestQRUtility(unittest.TestCase):
 
 
 # ───────────────────────────────────────────────────────────────
-# PHASE 11 — SSRF GUARD (AST — function lives in general/router)
+# PHASE 10B — QR DataOverflowError handler (AST + unit)
 # ───────────────────────────────────────────────────────────────
+class TestQRDataOverflowHandling(unittest.TestCase):
+    """Verify Phase 2B: DataOverflowError caught and surfaced as a user-friendly message."""
+
+    def _get_cmd_qr_src(self) -> str:
+        import ast
+        src = open("app/features/media/router.py").read()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "cmd_qr":
+                return ast.unparse(node)
+        self.fail("cmd_qr handler not found in media/router.py")
+
+    def test_dataoverflow_import_present(self):
+        """QRDataOverflowError (qrcode.exceptions.DataOverflowError) must be imported."""
+        src = open("app/features/media/router.py").read()
+        self.assertIn(
+            "DataOverflowError",
+            src,
+            "qrcode.exceptions.DataOverflowError must be imported in media/router.py",
+        )
+
+    def test_dataoverflow_caught_specifically(self):
+        """cmd_qr must have an except clause for QRDataOverflowError, not bare Exception."""
+        import ast
+        src = open("app/features/media/router.py").read()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "cmd_qr":
+                fn_src = ast.unparse(node)
+                self.assertIn(
+                    "QRDataOverflowError",
+                    fn_src,
+                    "cmd_qr must catch QRDataOverflowError by name",
+                )
+                return
+        self.fail("cmd_qr not found")
+
+    def test_dataoverflow_not_broad_except(self):
+        """The DataOverflow handler must NOT use a bare except Exception in the generation block."""
+        import ast, re
+        cmd_src = self._get_cmd_qr_src()
+        # The fix must be targeted: except QRDataOverflowError (or DataOverflowError)
+        # A bare 'except Exception' swallowing all errors is forbidden
+        # We verify generate_qr_buffer is NOT inside a bare except-Exception block
+        # by checking the handler source for the pattern
+        self.assertNotIn(
+            "except Exception",
+            cmd_src,
+            "cmd_qr must not use bare 'except Exception' to catch DataOverflowError",
+        )
+
+    def test_dataoverflow_user_message_content(self):
+        """The overflow error reply must mention shortening the input — no traceback in reply text."""
+        import ast, re
+        src = open("app/features/media/router.py").read()
+        tree = ast.parse(src)
+        reply_strings = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "cmd_qr":
+                # Extract string literals from all await message.reply() calls inside cmd_qr
+                for call in ast.walk(node):
+                    if (isinstance(call, ast.Call) and
+                            isinstance(call.func, ast.Attribute) and
+                            call.func.attr == "reply"):
+                        for arg in call.args:
+                            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                                reply_strings.append(arg.value)
+        # The overflow reply must guide the user to shorten input
+        overflow_replies = [s for s in reply_strings if "large" in s.lower() or "shorten" in s.lower()]
+        self.assertTrue(
+            len(overflow_replies) >= 1,
+            "Overflow error reply must mention the data is too large or suggest shortening",
+        )
+        # None of the user-facing reply strings should expose a Python traceback
+        for reply in reply_strings:
+            self.assertNotIn("Traceback", reply, "Reply must not contain Python traceback")
+            self.assertNotIn("File \"", reply, "Reply must not contain file paths from tracebacks")
+
+    def test_dataoverflow_reply_uses_html_mode(self):
+        """The overflow error reply must use parse_mode=HTML (consistent with handler)."""
+        import ast
+        cmd_src = self._get_cmd_qr_src()
+        # Confirm the overflow reply branch uses HTML
+        self.assertIn(
+            'parse_mode=\'HTML\'',
+            cmd_src,
+            "Overflow error reply must use parse_mode='HTML'",
+        )
+        self.assertNotIn(
+            'parse_mode=\'Markdown\'',
+            cmd_src,
+            "cmd_qr must not use Markdown parse mode anywhere",
+        )
+
+    def test_valid_path_still_uses_generate_qr_buffer(self):
+        """The successful code path must still call qr.generate_qr_buffer()."""
+        cmd_src = self._get_cmd_qr_src()
+        self.assertIn(
+            "qr.generate_qr_buffer(content)",
+            cmd_src,
+            "Valid path must still call qr.generate_qr_buffer(content)",
+        )
+
+    def test_finally_block_still_closes_bio(self):
+        """The existing try/finally that closes bio must be preserved."""
+        cmd_src = self._get_cmd_qr_src()
+        self.assertIn("bio.close()", cmd_src, "bio.close() in finally block must be preserved")
+        self.assertIn("finally", cmd_src, "finally block must be preserved")
+
+    def test_unexpected_exception_not_swallowed(self):
+        """Only QRDataOverflowError is caught — verified structurally via AST.
+
+        The except clause in cmd_qr must name QRDataOverflowError explicitly.
+        No bare 'except Exception' or 'except BaseException' exists in the generation
+        block, which proves unexpected exceptions propagate to PlatformErrorMiddleware.
+        """
+        import ast
+        src = open("app/features/media/router.py").read()
+        tree = ast.parse(src)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "cmd_qr":
+                # Collect all ExceptHandler nodes inside cmd_qr
+                except_handlers = [
+                    n for n in ast.walk(node) if isinstance(n, ast.ExceptHandler)
+                ]
+                self.assertGreater(len(except_handlers), 0, "cmd_qr has no except clause")
+
+                for handler in except_handlers:
+                    if handler.type is None:
+                        self.fail("cmd_qr has a bare 'except:' — unexpected exceptions swallowed")
+                    handler_type = ast.unparse(handler.type)
+                    self.assertIn(
+                        "DataOverflowError",
+                        handler_type,
+                        f"Unexpected except clause: 'except {handler_type}' — "
+                        "only DataOverflowError should be caught in cmd_qr",
+                    )
+                return
+        self.fail("cmd_qr not found in media/router.py")
+
+    @needs_qrcode
+    def test_dataoverflow_raised_for_oversized_input(self):
+        """generate_qr_buffer must raise DataOverflowError for extremely large input."""
+        from qrcode.exceptions import DataOverflowError
+        from app.utils.qr import generate_qr_buffer
+        # QR Version 40 max binary capacity ~2953 bytes; 10000 'A' chars will overflow
+        oversized = "A" * 10000
+        with self.assertRaises(DataOverflowError, msg="Oversized input must raise DataOverflowError"):
+            generate_qr_buffer(oversized)
+
+
+
 class TestSSRFGuardAST(unittest.TestCase):
     """Verify SSRF guard function logic via AST without importing aiogram."""
 

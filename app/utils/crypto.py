@@ -28,7 +28,19 @@ def check_password_strength(password: str) -> str:
 
 def gen_hashes(text: str) -> tuple:
     b = text.encode('utf-8')
-    return hashlib.md5(b).hexdigest(), hashlib.sha256(b).hexdigest(), hashlib.sha512(b).hexdigest()
+    return (
+        hashlib.md5(b).hexdigest(),
+        hashlib.sha256(b).hexdigest(),
+        hashlib.sha512(b).hexdigest(),
+        # SHA-3 family (FIPS 202)
+        hashlib.sha3_224(b).hexdigest(),
+        hashlib.sha3_256(b).hexdigest(),
+        hashlib.sha3_384(b).hexdigest(),
+        hashlib.sha3_512(b).hexdigest(),
+        # BLAKE2 family
+        hashlib.blake2b(b).hexdigest(),
+        hashlib.blake2s(b).hexdigest(),
+    )
 
 def b64_encode(text: str) -> str:
     return base64.b64encode(text.encode('utf-8')).decode('utf-8')
