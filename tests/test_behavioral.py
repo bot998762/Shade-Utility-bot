@@ -3675,3 +3675,137 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2L: TranslatorService exception hardening tests
+# ---------------------------------------------------------------------------
+
+from unittest import IsolatedAsyncioTestCase
+
+
+def _skip_no_deep_translator(test_case):
+    try:
+        import deep_translator  # noqa: F401
+    except ImportError:
+        test_case.skipTest("deep_translator not installed in this environment")
+
+
+class TestTranslatorExceptionHardening(IsolatedAsyncioTestCase):
+    """Service-level: verify every provider exception is normalized."""
+
+    def setUp(self):
+        _skip_no_deep_translator(self)
+        from app.services.translator_service import TranslatorService
+        from app.core.exceptions import ProviderAPIError
+        self._svc_cls = TranslatorService
+        self._ProviderAPIError = ProviderAPIError
+
+    async def _translate(self, text="hello", lang="en"):
+        svc = self._svc_cls()
+        return await svc.translate(text, lang)
+
+    # --- Input validation ---
+
+    async def test_empty_string_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            await self._translate(text="")
+
+    async def test_whitespace_only_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            await self._translate(text="   ")
+
+    async def test_text_over_limit_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            await self._translate(text="x" * 1001)
+
+    async def test_text_at_limit_calls_provider(self):
+        from unittest.mock import patch
+        text = "x" * 1000
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.return_value = "translated"
+            result = await self._translate(text=text)
+        self.assertEqual(result, "translated")
+
+    # --- Provider exception mapping ---
+
+    async def _assert_provider_error(self, exc_instance):
+        from unittest.mock import patch
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.side_effect = exc_instance
+            with self.assertRaises(self._ProviderAPIError):
+                await self._translate()
+
+    async def _assert_value_error(self, exc_instance):
+        from unittest.mock import patch
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.side_effect = exc_instance
+            with self.assertRaises(ValueError):
+                await self._translate()
+
+    async def test_request_error_raises_provider_api_error(self):
+        from deep_translator.exceptions import RequestError
+        await self._assert_provider_error(RequestError("test"))
+
+    async def test_too_many_requests_raises_provider_api_error(self):
+        from deep_translator.exceptions import TooManyRequests
+        await self._assert_provider_error(TooManyRequests())
+
+    async def test_translation_not_found_raises_provider_api_error(self):
+        from deep_translator.exceptions import TranslationNotFound
+        await self._assert_provider_error(TranslationNotFound())
+
+    async def test_element_not_found_raises_provider_api_error(self):
+        from deep_translator.exceptions import ElementNotFoundInGetRequest
+        await self._assert_provider_error(ElementNotFoundInGetRequest("x", "y"))
+
+    async def test_server_exception_raises_provider_api_error(self):
+        from deep_translator.exceptions import ServerException
+        await self._assert_provider_error(ServerException())
+
+    async def test_not_valid_payload_raises_value_error(self):
+        from deep_translator.exceptions import NotValidPayload
+        await self._assert_value_error(NotValidPayload())
+
+    async def test_not_valid_length_raises_value_error(self):
+        from deep_translator.exceptions import NotValidLength
+        await self._assert_value_error(NotValidLength(0, 1000))
+
+    async def test_none_result_raises_provider_api_error(self):
+        from unittest.mock import patch
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.return_value = None
+            with self.assertRaises(self._ProviderAPIError):
+                await self._translate()
+
+    async def test_empty_result_raises_provider_api_error(self):
+        from unittest.mock import patch
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.return_value = ""
+            with self.assertRaises(self._ProviderAPIError):
+                await self._translate()
+
+    async def test_runtime_error_propagates(self):
+        from unittest.mock import patch
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.side_effect = RuntimeError("boom")
+            with self.assertRaises(RuntimeError):
+                await self._translate()
+
+    async def test_language_alias_hindi(self):
+        from unittest.mock import patch
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.return_value = "नमस्ते"
+            result = await self._translate(text="hello", lang="hindi")
+        self.assertEqual(result, "नमस्ते")
+        # Verify 'hi' was passed as target
+        mock_cls.assert_called_once()
+        call_kwargs = mock_cls.call_args
+        self.assertIn("hi", str(call_kwargs))
+
+    async def test_successful_translation_returns_result(self):
+        from unittest.mock import patch
+        with patch("app.services.translator_service.GoogleTranslator") as mock_cls:
+            mock_cls.return_value.translate.return_value = "Bonjour"
+            result = await self._translate(text="Hello", lang="fr")
+        self.assertEqual(result, "Bonjour")

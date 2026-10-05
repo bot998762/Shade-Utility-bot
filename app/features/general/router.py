@@ -1,7 +1,8 @@
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone as _timezone
 from urllib.parse import quote
+from zoneinfo import ZoneInfo as _ZoneInfo, ZoneInfoNotFoundError as _ZoneInfoNotFoundError
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
@@ -16,18 +17,28 @@ logger = setup_logger()
 manifest = FeatureManifest(name="GeneralTools", version="1.0.0", category="Core")
 router = Router()
 
+# Phase 2D — /ip response cache + bounded retry
+try:
+    from cachetools import TTLCache as _TTLCache
+    _IP_CACHE: "_TTLCache[str, dict] | None" = _TTLCache(maxsize=256, ttl=300)
+except ImportError:  # pragma: no cover — cachetools absent in CI sandbox
+    _IP_CACHE = None  # type: ignore[assignment]
+
+_IP_MAX_RETRIES: int = 2  # 2 retries → 3 total attempts
+
 HELP_MANUAL_TEXT = """📖 **SHADE UTILITY — ADVANCED USER MANUAL**
 ───────────────────────────
 
 ⚙️ **DEVELOPER & CRYPTO TOOLS**
-• `/epoch <timestamp|date>` ➔ Convert Unix timestamp to ISO UTC or vice versa.
-• `/time` ➔ Return current Unix epoch timestamp instantly.
+• `/epoch [timestamp|date] [timezone]` ➔ Bidirectional timestamp converter. No-arg: current epoch + UTC. With timestamp: UTC date + relative time. With ISO date: epoch + relative time. Optional IANA timezone (e.g. `America/New_York`).
+• `/time` ➔ Return current Unix epoch timestamp. (Alias for the timestamp portion of `/epoch`.)
 • `/urlen <text>` ➔ Percent-encode string for safe URL query transmission.
 • `/urlde <text>` ➔ Decode percent-encoded URL string back to plain text.
 • `/b64en <text>` ➔ Convert string to standard Base64 representation.
 • `/b64de <string>` ➔ Decode Base64 encoded payload back to plain text.
 • `/hash <text>` ➔ Calculate MD5, SHA-256, SHA-512, SHA3-256, SHA3-512, BLAKE2b, BLAKE2s hashes.
-• `/password [length]` ➔ Generate high-entropy cryptographic password (8-64 chars).
+• `/password [length]` ➔ Generate high-entropy cryptographic password (8-64 chars). Includes entropy estimate in bits.
+• `/password phrase` ➔ Generate a 4-word passphrase (~37.5 bits entropy).
 • `/checkpwd <password>` ➔ Evaluate entropy score and character complexity.
 • `/uuid` ➔ Generate a cryptographically secure random UUIDv4 string.
 • `/jsonfmt <json_str>` ➔ Validate and pretty-print raw JSON payload.
@@ -47,6 +58,7 @@ HELP_MANUAL_TEXT = """📖 **SHADE UTILITY — ADVANCED USER MANUAL**
 • `/ip <ip|domain>` ➔ Query IP location, ISP, country, and timezone.
 • `/weather <city>` ➔ Fetch live temperature, humidity, and forecast.
 • `/short <url>` ➔ Shorten long URLs using high-uptime shortener engine.
+• `/short expand <url>` ➔ Safely trace a short URL to its final destination.
 • `/ua` ➔ Inspect user payload, telegram engine info, and protocol.
 • `/info` ➔ Inspect detailed Telegram profile metadata.
 • `/id` ➔ Retrieve instant numeric ID for user, chat, thread, or message.
@@ -80,8 +92,8 @@ async def handle_dev_cat(call: CallbackQuery) -> None:
     msg = (
         "🛠️ **DEVELOPER & CRYPTO UTILITIES**\n"
         "───────────────────────────\n"
-        "⏰ `/epoch <time>` ➔ Timestamp / ISO Date Converter\n"
-        "🕐 `/time` ➔ Current Unix Epoch Timestamp\n"
+        "⏰ `/epoch [time] [tz]` ➔ Timestamp / ISO Date Converter + Relative Time + Timezone\n"
+        "🕐 `/time` ➔ Current Unix Epoch (quick alias; /epoch shows more detail)\n"
         "🔗 `/urlen <text>` ➔ URL Encoder\n"
         "🔓 `/urlde <text>` ➔ URL Decoder\n"
         "🔢 `/b64en <text>` ➔ Base64 Encoder\n"
@@ -168,31 +180,105 @@ async def back_to_main(call: CallbackQuery, bot_username: str = "ShadeUtilityBot
     await call.answer()
 
 
+def _relative_time(ts: int, now: int) -> str:
+    """Return human-readable relative time string for a Unix timestamp vs now."""
+    diff = ts - now
+    abs_diff = abs(diff)
+    if abs_diff < 60:
+        label = f"{abs_diff} second{'s' if abs_diff != 1 else ''}"
+    elif abs_diff < 3600:
+        m = abs_diff // 60
+        label = f"{m} minute{'s' if m != 1 else ''}"
+    elif abs_diff < 86400:
+        h = abs_diff // 3600
+        label = f"{h} hour{'s' if h != 1 else ''}"
+    elif abs_diff < 86400 * 30:
+        d = abs_diff // 86400
+        label = f"{d} day{'s' if d != 1 else ''}"
+    elif abs_diff < 86400 * 365:
+        mo = abs_diff // (86400 * 30)
+        label = f"{mo} month{'s' if mo != 1 else ''}"
+    else:
+        y = abs_diff // (86400 * 365)
+        label = f"{y} year{'s' if y != 1 else ''}"
+    return f"in {label}" if diff > 0 else f"{label} ago"
+
+
+def _tz_format(ts: int, tz_name: str) -> str:
+    """Format a Unix timestamp in the given IANA timezone."""
+    tz = _ZoneInfo(tz_name)
+    dt = datetime.fromtimestamp(ts, tz=tz)
+    return dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+
 @router.message(Command("epoch"))
 async def cmd_epoch(message: Message) -> None:
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        now = int(time.time())
-        dt = datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S UTC')
+    # Parse args: /epoch [value] [timezone]
+    parts = message.text.split(maxsplit=3)
+    now = int(time.time())
+
+    if len(parts) < 2:
+        # Current epoch mode
+        dt_utc = datetime.fromtimestamp(now, tz=_timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         await message.reply(
             f"⏰ **Current Unix Epoch:**\n`{now}`\n\n"
-            f"📅 **Formatted UTC:**\n`{dt}`\n\n"
-            f"💡 *Usage:* `/epoch <timestamp>` or `/epoch <YYYY-MM-DD>`",
+            f"📅 **Formatted UTC:**\n`{dt_utc}`\n\n"
+            f"💡 *Usage:* `/epoch <timestamp|date> [timezone]`\n"
+            f"*Example:* `/epoch 1700000000 America/New_York`",
             parse_mode="Markdown",
         )
         return
 
-    val = args[1].strip()
+    val = parts[1].strip()
+    tz_name = parts[2].strip() if len(parts) >= 3 else None
+
+    # Validate timezone first if provided
+    if tz_name:
+        try:
+            _ZoneInfo(tz_name)
+        except _ZoneInfoNotFoundError:
+            await message.reply(
+                f"❌ **Unknown timezone:** `{tz_name}`\n"
+                f"Use an IANA timezone name, e.g. `America/New_York`, `Europe/London`",
+                parse_mode="Markdown",
+            )
+            return
+        except Exception:
+            await message.reply("❌ **Invalid timezone format.**", parse_mode="Markdown")
+            return
+
     try:
-        if val.isdigit():
+        if val.lstrip("-").isdigit():
+            # Integer timestamp → UTC datetime + relative time
             ts = int(val)
-            dt = datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S UTC')
-            await message.reply(f"⏰ **Timestamp:** `{ts}`\n📅 **UTC Date:** `{dt}`", parse_mode="Markdown")
+            dt_utc = datetime.fromtimestamp(ts, tz=_timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            rel = _relative_time(ts, now)
+            reply = (
+                f"⏰ **Timestamp:** `{ts}`\n"
+                f"📅 **UTC Date:** `{dt_utc}`\n"
+                f"🕐 **Relative:** {rel}"
+            )
+            if tz_name:
+                dt_local = _tz_format(ts, tz_name)
+                reply += f"\n🌍 **{tz_name}:** `{dt_local}`"
+            await message.reply(reply, parse_mode="Markdown")
         else:
+            # ISO date → epoch + relative time
             dt_obj = datetime.fromisoformat(val)
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=_timezone.utc)
             ts = int(dt_obj.timestamp())
-            await message.reply(f"📅 **Input Date:** `{val}`\n⏰ **Unix Epoch:** `{ts}`", parse_mode="Markdown")
-    except Exception:
+            rel = _relative_time(ts, now)
+            reply = (
+                f"📅 **Input Date:** `{val}`\n"
+                f"⏰ **Unix Epoch:** `{ts}`\n"
+                f"🕐 **Relative:** {rel}"
+            )
+            if tz_name:
+                dt_local = _tz_format(ts, tz_name)
+                reply += f"\n🌍 **{tz_name}:** `{dt_local}`"
+            await message.reply(reply, parse_mode="Markdown")
+    except (ValueError, OSError, OverflowError):
         await message.reply("❌ **Invalid Date or Timestamp format.**", parse_mode="Markdown")
 
 
@@ -226,8 +312,30 @@ async def cmd_checkpwd(message: Message) -> None:
     if len(args) < 2:
         await message.reply("❌ **Usage:** `/checkpwd <password>`", parse_mode="Markdown")
         return
-    strength = crypto.check_password_strength(args[1])
-    await message.reply(f"🛡️ **Security Entropy Evaluation:**\nStrength: `{strength}`", parse_mode="Markdown")
+    result = crypto.check_password_strength_detailed(args[1])
+    checks = result["checks"]
+
+    def _tick(v: bool) -> str:
+        return "✅" if v else "❌"
+
+    breakdown = (
+        f"{_tick(checks['length_8'])} At least 8 characters (length: {result['length']})\n"
+        f"{_tick(checks['length_12'])} At least 12 characters\n"
+        f"{_tick(checks['mixed_case'])} Mixed case (upper + lower)\n"
+        f"{_tick(checks['has_digits'])} Contains digits\n"
+        f"{_tick(checks['has_symbols'])} Contains symbols\n"
+    )
+    common_warning = "\n⚠️ *This is a commonly used password — change it!*" if result["is_common"] else ""
+    score_bar = "█" * result["score"] + "░" * (5 - result["score"])
+    await message.reply(
+        f"🛡️ **Password Strength: {result['label']}**\n"
+        f"Score: `{score_bar}` {result['score']}/5\n"
+        f"───────────────────────────\n"
+        f"{breakdown}"
+        f"───────────────────────────"
+        f"{common_warning}",
+        parse_mode="Markdown",
+    )
 
 
 @router.message(Command("ua"))
@@ -269,116 +377,206 @@ async def cmd_jsonfmt(message: Message) -> None:
 @router.message(Command("ip"))
 async def cmd_ip(message: Message, bootstrap_ref) -> None:
     import html as _html
+    import asyncio as _asyncio
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.reply("❌ <b>Usage:</b> <code>/ip &lt;ip_address_or_domain&gt;</code>", parse_mode="HTML")
         return
     query = args[1].strip()
 
+    # SSRF check MUST happen before cache lookup
     if not _is_safe_host(query):
         await message.reply("❌ Private/reserved addresses are not allowed.", parse_mode="HTML")
+        return
+
+    cache_key = query.lower()
+
+    # Cache lookup
+    if _IP_CACHE is not None and cache_key in _IP_CACHE:
+        data = _IP_CACHE[cache_key]
+        e_query   = _html.escape(str(data.get("query", "")))
+        e_country = _html.escape(str(data.get("country", "")))
+        e_cc      = _html.escape(str(data.get("countryCode", "")))
+        e_city    = _html.escape(str(data.get("city", "")))
+        e_region  = _html.escape(str(data.get("regionName", "")))
+        e_isp     = _html.escape(str(data.get("isp", "")))
+        e_tz      = _html.escape(str(data.get("timezone", "")))
+        res_text = (
+            f"🌐 <b>Network Geo-Lookup Result</b>\n"
+            f"───────────────────────────\n"
+            f"📍 <b>Target:</b> <code>{e_query}</code>\n"
+            f"🏳️ <b>Country:</b> {e_country} ({e_cc})\n"
+            f"🏙️ <b>City/Region:</b> {e_city}, {e_region}\n"
+            f"📡 <b>ISP Provider:</b> {e_isp}\n"
+            f"🕒 <b>Timezone:</b> <code>{e_tz}</code>\n"
+            f"───────────────────────────"
+        )
+        await message.reply(res_text, parse_mode="HTML")
         return
 
     status = await message.reply("🔍 Executing Network Geo-Lookup...")
     import aiohttp, json as _json, time as _time
     session: aiohttp.ClientSession = bootstrap_ref.http_session
-    # ip-api.com: HTTP is the free-tier endpoint; HTTPS requires a paid key.
+    # ip-api.com: HTTP is the free-tier endpoint; HTTPS requires a paid key (KI-009).
     url = f"http://ip-api.com/json/{query}"
-    t0 = _time.monotonic()
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            raw = await resp.text(encoding="utf-8", errors="replace")
-            latency_ms = int((_time.monotonic() - t0) * 1000)
 
-            if resp.status == 429:
-                logger.warning({"event": "ip_rate_limited", "query": query, "latency_ms": latency_ms})
-                await status.edit_text(
-                    "⏳ IP lookup service is temporarily rate-limited. Please try again in a moment.",
-                    parse_mode="HTML",
-                )
-                return
+    last_error_text: str = "❌ IP lookup error. Please try again later."
+    attempt = 0
+    while attempt <= _IP_MAX_RETRIES:
+        if attempt > 0:
+            await _asyncio.sleep(0.5)
+        attempt += 1
+        t0 = _time.monotonic()
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                raw = await resp.text(encoding="utf-8", errors="replace")
+                latency_ms = int((_time.monotonic() - t0) * 1000)
 
-            if resp.status != 200:
-                logger.warning({
-                    "event": "ip_http_error",
-                    "query": query,
-                    "status": resp.status,
-                    "latency_ms": latency_ms,
-                })
-                await status.edit_text(
-                    "❌ IP lookup service is temporarily unavailable.",
-                    parse_mode="HTML",
-                )
-                return
+                if resp.status == 429:
+                    # Never retry 429
+                    logger.warning({"event": "ip_rate_limited", "query": query, "latency_ms": latency_ms})
+                    await status.edit_text(
+                        "⏳ IP lookup service is temporarily rate-limited. Please try again in a moment.",
+                        parse_mode="HTML",
+                    )
+                    return
 
-            try:
-                data = _json.loads(raw)
-            except (_json.JSONDecodeError, ValueError):
-                logger.error({
-                    "event": "ip_non_json",
-                    "query": query,
-                    "body_preview": raw[:150],
-                    "latency_ms": latency_ms,
-                })
-                await status.edit_text(
-                    "❌ Unexpected response from IP lookup service.",
-                    parse_mode="HTML",
-                )
-                return
+                if resp.status >= 500:
+                    # 5xx — transient, retry
+                    logger.warning({
+                        "event": "ip_http_error",
+                        "query": query,
+                        "status": resp.status,
+                        "attempt": attempt,
+                        "latency_ms": latency_ms,
+                    })
+                    last_error_text = "❌ IP lookup service is temporarily unavailable."
+                    continue
 
-            if data.get("status") == "success":
-                # Escape all external API strings — ISP names like "AT&T", "O2_Mobile" etc.
-                e_query   = _html.escape(str(data.get("query", "")))
-                e_country = _html.escape(str(data.get("country", "")))
-                e_cc      = _html.escape(str(data.get("countryCode", "")))
-                e_city    = _html.escape(str(data.get("city", "")))
-                e_region  = _html.escape(str(data.get("regionName", "")))
-                e_isp     = _html.escape(str(data.get("isp", "")))
-                e_tz      = _html.escape(str(data.get("timezone", "")))
-                res_text = (
-                    f"🌐 <b>Network Geo-Lookup Result</b>\n"
-                    f"───────────────────────────\n"
-                    f"📍 <b>Target:</b> <code>{e_query}</code>\n"
-                    f"🏳️ <b>Country:</b> {e_country} ({e_cc})\n"
-                    f"🏙️ <b>City/Region:</b> {e_city}, {e_region}\n"
-                    f"📡 <b>ISP Provider:</b> {e_isp}\n"
-                    f"🕒 <b>Timezone:</b> <code>{e_tz}</code>\n"
-                    f"───────────────────────────"
-                )
-                await status.edit_text(res_text, parse_mode="HTML")
-            else:
-                fail_msg = _html.escape(str(data.get("message", "unknown")))
-                e_q = _html.escape(query)
-                logger.info({"event": "ip_lookup_failed", "query": query, "reason": data.get("message")})
-                await status.edit_text(
-                    f"❌ Could not look up <code>{e_q}</code>: {fail_msg}",
-                    parse_mode="HTML",
-                )
+                if resp.status != 200:
+                    # 4xx (not 429) — do not retry
+                    logger.warning({
+                        "event": "ip_http_error",
+                        "query": query,
+                        "status": resp.status,
+                        "latency_ms": latency_ms,
+                    })
+                    await status.edit_text(
+                        "❌ IP lookup service is temporarily unavailable.",
+                        parse_mode="HTML",
+                    )
+                    return
 
-    except aiohttp.ServerTimeoutError:
-        logger.warning({"event": "ip_timeout", "query": query})
-        await status.edit_text("⏱️ IP lookup timed out. Please try again.", parse_mode="HTML")
-    except aiohttp.ClientConnectorError as exc:
-        logger.error({"event": "ip_connection_error", "error": type(exc).__name__})
-        await status.edit_text("❌ Cannot reach IP lookup service.", parse_mode="HTML")
-    except Exception as exc:
-        logger.error({"event": "ip_unexpected_error", "query": query, "error": type(exc).__name__})
-        await status.edit_text("❌ IP lookup error. Please try again later.", parse_mode="HTML")
+                try:
+                    data = _json.loads(raw)
+                except (_json.JSONDecodeError, ValueError):
+                    logger.error({
+                        "event": "ip_non_json",
+                        "query": query,
+                        "body_preview": raw[:150],
+                        "latency_ms": latency_ms,
+                    })
+                    await status.edit_text(
+                        "❌ Unexpected response from IP lookup service.",
+                        parse_mode="HTML",
+                    )
+                    return
+
+                if data.get("status") == "success":
+                    # Cache the successful response
+                    if _IP_CACHE is not None:
+                        _IP_CACHE[cache_key] = data
+                    # Escape all external API strings — ISP names like "AT&T", "O2_Mobile" etc.
+                    e_query   = _html.escape(str(data.get("query", "")))
+                    e_country = _html.escape(str(data.get("country", "")))
+                    e_cc      = _html.escape(str(data.get("countryCode", "")))
+                    e_city    = _html.escape(str(data.get("city", "")))
+                    e_region  = _html.escape(str(data.get("regionName", "")))
+                    e_isp     = _html.escape(str(data.get("isp", "")))
+                    e_tz      = _html.escape(str(data.get("timezone", "")))
+                    res_text = (
+                        f"🌐 <b>Network Geo-Lookup Result</b>\n"
+                        f"───────────────────────────\n"
+                        f"📍 <b>Target:</b> <code>{e_query}</code>\n"
+                        f"🏳️ <b>Country:</b> {e_country} ({e_cc})\n"
+                        f"🏙️ <b>City/Region:</b> {e_city}, {e_region}\n"
+                        f"📡 <b>ISP Provider:</b> {e_isp}\n"
+                        f"🕒 <b>Timezone:</b> <code>{e_tz}</code>\n"
+                        f"───────────────────────────"
+                    )
+                    await status.edit_text(res_text, parse_mode="HTML")
+                else:
+                    # Provider-level failure — do not retry, never cache
+                    fail_msg = _html.escape(str(data.get("message", "unknown")))
+                    e_q = _html.escape(query)
+                    logger.info({"event": "ip_lookup_failed", "query": query, "reason": data.get("message")})
+                    await status.edit_text(
+                        f"❌ Could not look up <code>{e_q}</code>: {fail_msg}",
+                        parse_mode="HTML",
+                    )
+                return  # success or non-retryable failure — exit loop
+
+        except aiohttp.ServerTimeoutError:
+            logger.warning({"event": "ip_timeout", "query": query, "attempt": attempt})
+            last_error_text = "⏱️ IP lookup timed out. Please try again."
+            continue  # retry on timeout
+        except aiohttp.ClientConnectorError as exc:
+            logger.error({"event": "ip_connection_error", "error": type(exc).__name__, "attempt": attempt})
+            last_error_text = "❌ Cannot reach IP lookup service."
+            continue  # retry on connector error
+        except Exception as exc:
+            logger.error({"event": "ip_unexpected_error", "query": query, "error": type(exc).__name__})
+            await status.edit_text("❌ IP lookup error. Please try again later.", parse_mode="HTML")
+            return
+
+    # All retries exhausted
+    await status.edit_text(last_error_text, parse_mode="HTML")
 
 
 @router.message(Command("weather"))
 async def cmd_weather(message: Message, bootstrap_ref) -> None:
+    """
+    Phase 2G: /weather <city> [days:1-3] [unit:C|F]
+    Examples:
+      /weather London
+      /weather London 3
+      /weather London F
+      /weather London 3 F
+    """
     import html as _html
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.reply("❌ <b>Usage:</b> <code>/weather &lt;city_name&gt;</code>", parse_mode="HTML")
+    # Parse: /weather <city_tokens...> with optional trailing unit and day count
+    raw_args = message.text.split()[1:]  # drop command
+    if not raw_args:
+        await message.reply(
+            "❌ <b>Usage:</b> <code>/weather &lt;city&gt; [days] [C|F]</code>\n"
+            "<i>Examples: /weather London | /weather Tokyo 3 | /weather Paris F</i>",
+            parse_mode="HTML",
+        )
         return
-    city = args[1].strip()
+
+    # Extract optional trailing unit (C or F) and day count (1-3)
+    unit = "C"
+    days = 1  # default: current conditions only
+    tokens = list(raw_args)
+    # Check last token for unit
+    if tokens[-1].upper() in ("C", "F"):
+        unit = tokens[-1].upper()
+        tokens = tokens[:-1]
+    # Check new last token for day count
+    if tokens and tokens[-1].isdigit() and tokens[-1] in ("1", "2", "3"):
+        days = int(tokens[-1])
+        tokens = tokens[:-1]
+    if not tokens:
+        await message.reply("❌ City name required.", parse_mode="HTML")
+        return
+
+    city = " ".join(tokens).strip()
     if len(city) > 100:
         await message.reply("❌ City name too long.", parse_mode="HTML")
         return
 
     e_city = _html.escape(city)
+    unit_label = "°F" if unit == "F" else "°C"
     status = await message.reply(f"⛅ Fetching weather for <b>{e_city}</b>...", parse_mode="HTML")
     import aiohttp, json as _json, time as _time
     session: aiohttp.ClientSession = bootstrap_ref.http_session
@@ -438,20 +636,49 @@ async def cmd_weather(message: Message, bootstrap_ref) -> None:
             try:
                 current = data["current_condition"][0]
                 area    = data["nearest_area"][0]
-                # Escape all external-API strings — ISP/city/description can contain &, <, >
                 e_area    = _html.escape(str(area["areaName"][0]["value"]))
                 e_country = _html.escape(str(area["country"][0]["value"]))
                 e_desc    = _html.escape(str(current["weatherDesc"][0]["value"]))
+
+                # Unit-aware current conditions
+                if unit == "F":
+                    temp_now   = f"{current['temp_F']}{unit_label}"
+                    feels_now  = f"{current['FeelsLikeF']}{unit_label}"
+                else:
+                    temp_now   = f"{current['temp_C']}{unit_label}"
+                    feels_now  = f"{current['FeelsLikeC']}{unit_label}"
+
                 res_text = (
                     f"⛅ <b>Weather: {e_area}, {e_country}</b>\n"
                     f"───────────────────────────\n"
-                    f"🌡️ <b>Temperature:</b> <code>{current['temp_C']}°C</code>"
-                    f" (Feels <code>{current['FeelsLikeC']}°C</code>)\n"
+                    f"🌡️ <b>Now:</b> <code>{temp_now}</code> (Feels <code>{feels_now}</code>)\n"
                     f"☁️ <b>Condition:</b> {e_desc}\n"
                     f"💧 <b>Humidity:</b> <code>{current['humidity']}%</code>\n"
                     f"💨 <b>Wind:</b> <code>{current['windspeedKmph']} km/h</code>\n"
-                    f"───────────────────────────"
                 )
+
+                # Multi-day forecast (days 1-3 available from weather array)
+                forecast_days = data.get("weather", [])
+                if days > 1 and forecast_days:
+                    res_text += "───────────────────────────\n📅 <b>Forecast:</b>\n"
+                    for fd in forecast_days[:days]:
+                        e_date = _html.escape(str(fd.get("date", "")))
+                        if unit == "F":
+                            lo = f"{fd['mintempF']}{unit_label}"
+                            hi = f"{fd['maxtempF']}{unit_label}"
+                        else:
+                            lo = f"{fd['mintempC']}{unit_label}"
+                            hi = f"{fd['maxtempC']}{unit_label}"
+                        # Midday (noon) condition from hourly
+                        hourly = fd.get("hourly", [])
+                        day_desc = ""
+                        if hourly:
+                            # index 4 = noon (time 1200)
+                            mid = hourly[min(4, len(hourly) - 1)]
+                            day_desc = _html.escape(str(mid["weatherDesc"][0]["value"]))
+                        res_text += f"• <b>{e_date}:</b> {lo} – {hi} {day_desc}\n"
+
+                res_text += "───────────────────────────"
                 await status.edit_text(res_text, parse_mode="HTML")
             except (KeyError, IndexError, TypeError) as exc:
                 logger.error({

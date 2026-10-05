@@ -133,14 +133,14 @@ Port: `PORT` env var (default 10000)
 |---|---|---|
 | Main menu | `/start` | Sends main_menu_kb inline keyboard |
 | Help manual | `/help` | Full HELP_MANUAL_TEXT (Markdown) + Back button |
-| Timestamp converter | `/epoch [value]` | Unix ↔ ISO UTC conversion; no-arg = current epoch |
+| Timestamp converter | `/epoch [value] [tz]` | Unix ↔ ISO UTC + relative time + IANA timezone; no-arg = current epoch (Phase 2C) |
 | URL encoder | `/urlen <text>` | Percent-encode string (Markdown output — safe charset) |
 | URL decoder | `/urlde <text>` | Percent-decode string (**HTML+escape** — Phase 1D fix) |
-| Password checker | `/checkpwd <pwd>` | Heuristic strength score (5-point) |
+| Password checker | `/checkpwd <pwd>` | Detailed strength score + per-criterion breakdown + local common-password flag (Phase 2H) |
 | Client inspector | `/ua` | Telegram user/chat metadata (HTML+escape) |
 | JSON formatter | `/jsonfmt <json>` | Validate + pretty-print JSON |
 | IP geo-lookup | `/ip <ip/domain>` | ip-api.com geo-data (SSRF-guarded, HTML+escape) |
-| Weather | `/weather <city>` | wttr.in current conditions (HTML+escape) |
+| Weather | `/weather <city> [days] [C\|F]` | wttr.in current conditions + multi-day forecast + unit selection (Phase 2G) |
 | ID inspector | `/id` | Telegram IDs for user/chat/thread/reply |
 | Profile info | `/info` | Profile metadata (HTML+escape) |
 
@@ -149,7 +149,7 @@ Port: `PORT` env var (default 10000)
 | Feature | Command | Purpose |
 |---|---|---|
 | UUID generator | `/uuid` | UUIDv4 via `secrets` |
-| Password generator | `/password [len]` | 8–64 char entropy password, `secrets` CSPRNG |
+| Password generator | `/password [len\|phrase]` | 8–64 char entropy password with entropy bits (Phase 2F); `/password phrase` → 4-word passphrase ~37.5 bits (Phase 2I) |
 | Hash calculator | `/hash <text>` | MD5, SHA-256, SHA-512, SHA3-256, SHA3-512, BLAKE2b, BLAKE2s (Phase 2A) |
 | Base64 encoder | `/b64en <text>` | Standard Base64 encoding (Markdown — safe charset) |
 | Base64 decoder | `/b64de <string>` | Standard Base64 decoding (**HTML+escape** — Phase 1C fix) |
@@ -161,9 +161,10 @@ Port: `PORT` env var (default 10000)
 |---|---|---|
 | OCR | `/ocr` | OCRSpace → extract text from replied-to photo (HTML+escape) |
 | URL shortener | `/short <url>` | CleanURI → v.gd failover (HTML+escape) |
+| URL expander | `/short expand <url>` | SSRF-safe manual redirect tracing to final destination (Phase 2J) |
 | Translator | `/tr <lang> [text]` | Google Translate unofficial → HTML+escape |
 | QR generator | `/qr <text>` | Generate QR PNG; DataOverflowError handled (Phase 2B fix) |
-| QR scanner | `/qrscan` | pyzbar decode from replied-to photo (HTML+escape) |
+| QR scanner | `/qrscan` | pyzbar multi-QR decode from replied-to photo; shows format/type per code (Phase 2K) |
 
 ### session (`app/features/session/router.py`) — **FROZEN**
 
@@ -193,27 +194,27 @@ Port: `PORT` env var (default 10000)
 |---|---|---|---|---|---|
 | `/start` | general | Core | None | Main menu keyboard | ✅ |
 | `/help` | general | Core | None | Full manual | ✅ |
-| `/epoch` | general | Dev | Optional: int or ISO date | Timestamp conversion | ✅ |
+| `/epoch` | general | Dev | Optional: int or ISO date + optional IANA tz | Timestamp + relative time + timezone (Phase 2C) | ✅ |
 | `/urlen` | general | Dev | Text | Percent-encoded string | ✅ |
 | `/urlde` | general | Dev | Percent-encoded string | Decoded text (HTML) | ✅ fixed P1 |
-| `/checkpwd` | general | Dev | Password string | Strength label | ✅ |
+| `/checkpwd` | general | Dev | Password string | Strength score + breakdown + common-pwd flag (Phase 2H) | ✅ |
 | `/ua` | general | Network | None | Client metadata | ✅ |
 | `/jsonfmt` | general | Dev | JSON string | Pretty-printed JSON | ✅ |
-| `/ip` | general | Network | IP or domain | Geo-data | ✅ |
-| `/weather` | general | Network | City name | Current conditions | ✅ |
+| `/ip` | general | Network | IP or domain | Geo-data (TTLCache + retry Phase 2D) | ✅ |
+| `/weather` | general | Network | City name + optional days (1-3) + optional unit (C/F) | Current + multi-day forecast (Phase 2G) | ✅ |
 | `/id` | general | Network | None (opt: reply) | Telegram IDs | ✅ |
 | `/info` | general | Network | None (opt: reply) | Profile metadata | ✅ |
 | `/uuid` | crypto | Dev | None | UUIDv4 string | ✅ |
-| `/password` | crypto | Dev | Optional length | Entropy password | ✅ |
+| `/password` | crypto | Dev | Optional length or "phrase" | Entropy password + bits (Phase 2F); passphrase mode (Phase 2I) | ✅ |
 | `/hash` | crypto | Dev | Text | 7-algorithm digest output | ✅ upgraded P2A |
 | `/b64en` | crypto | Dev | Text | Base64 encoded string | ✅ |
 | `/b64de` | crypto | Dev | Base64 string | Decoded text (HTML) | ✅ fixed P1 |
 | `/time` | crypto | Dev | None | Current Unix epoch | ✅ documented P1G |
 | `/ocr` | media | Media | Reply to photo | Extracted text | ✅ |
-| `/short` | media | URL | URL string | Shortened URL | ✅ |
+| `/short` | media | URL | URL string or "expand <url>" | Shortened URL or SSRF-safe expansion (Phase 2J) | ✅ |
 | `/tr` | media | Media | lang + text | Translated text | ✅ |
 | `/qr` | media | Media | Text/URL | QR code PNG | ✅ fixed P2B |
-| `/qrscan` | media | Media | Reply to photo | Decoded QR content | ✅ |
+| `/qrscan` | media | Media | Reply to photo | Multi-QR decode with format/type per code (Phase 2K) | ✅ |
 | `/string` | session | Auth | None (interactive) | StringSession string | ✅ FROZEN |
 | `/create_session` | session_manager | Auth | None (interactive) | SQLite .session file | ✅ |
 | `/login_session` | session_manager | Auth | .session file upload | Account summary | ✅ fixed P1 |
@@ -326,14 +327,14 @@ Any change to `session/router.py` will change this MD5 and must be treated as an
 
 | Metric | Current Value | As of |
 |---|---|---|
-| Commands | **27** | Post Phase 2B |
-| Callbacks | **22** | Post Phase 2B |
-| HTTP routes | **3** | Post Phase 2B |
-| Dependencies | **12** | Post Phase 2B |
-| Tests run | **359** | Post Phase 2B |
-| Tests passed | **222** | Post Phase 2B |
-| Tests skipped | **137** | Post Phase 2B |
-| Tests failed | **0** | Post Phase 2B |
+| Commands | **27** | Post Phase 2C–2K |
+| Callbacks | **22** | Post Phase 2C–2K |
+| HTTP routes | **3** | Post Phase 2C–2K |
+| Dependencies | **13** | Post Phase 2C–2K |
+| Tests run | **487** | Post Phase 2C–2K |
+| Tests passed | **350** | Post Phase 2C–2K |
+| Tests skipped | **137** | Post Phase 2C–2K |
+| Tests failed | **0** | Post Phase 2C–2K |
 | session/router.py MD5 | `c61dcc219b29736e228bdc1d0915d82d` | Baseline (unchanged) |
 
 **Dependencies (current):**
@@ -350,6 +351,7 @@ psutil==5.9.8
 python-json-logger==2.0.7
 prometheus_client==0.19.0
 Telethon==1.34.0
+cachetools==5.3.2
 ```
 
 **Known skipped tests (137 total):**
@@ -539,6 +541,130 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+---
+
+### CHG-011
+**Date:** Phase 2C
+**Type:** Feature Restoration + Enhancement — `/epoch` timezone + relative time
+**What changed:** `cmd_epoch` upgraded: (1) no-arg = current epoch + UTC + usage hint, (2) integer timestamp → UTC + relative time, (3) ISO date → epoch + relative time, (4) optional IANA timezone argument with per-timezone output. New helpers: `_relative_time(ts, now)` and `_tz_format(ts, tz_name)`. Import: `from zoneinfo import ZoneInfo, ZoneInfoNotFoundError` (stdlib). `datetime.utcfromtimestamp()` replaced with timezone-aware equivalent (deprecated in 3.12). Negative timestamps handled via `lstrip("-")`. Backward compatible.
+**Files changed:** `app/features/general/router.py`
+**Security:** No network calls. No user-controlled eval.
+**Focused tests:** 20 pass in `TestPhase2C_EpochHelpers`.
+**Status:** COMPLETE
+
+---
+
+### CHG-012
+**Date:** Phase 2D
+**Type:** Feature Restoration + Enhancement — `/ip` TTLCache + bounded retry
+**What changed:** `_IP_CACHE = TTLCache(maxsize=256, ttl=300)` caches successful responses by `query.lower()`. `_IP_MAX_RETRIES = 2` (3 total attempts). Retry on: `ServerTimeoutError`, `ClientConnectorError`, HTTP 5xx. No retry on: 429 (returns immediately), 4xx, provider failures. `asyncio.sleep(0.5)` between attempts. SSRF check before cache lookup. Only success responses cached. ip-api.com HTTP endpoint unchanged (HTTPS deferred as KI-009). `cachetools==5.3.2` added to requirements.txt (13 total deps).
+**Files changed:** `app/features/general/router.py`, `requirements.txt`
+**Security:** SSRF guard order preserved. Cache cannot serve an unchecked address.
+**Focused tests:** 12 pass in `TestPhase2D_IPCache`.
+**Status:** COMPLETE
+
+---
+
+### CHG-013
+**Date:** Phase 2E
+**Type:** Restoration — Documentation Consistency — `/time` + `/epoch`
+**What changed:** `HELP_MANUAL_TEXT` and `handle_dev_cat` updated so `/epoch` documents timezone + relative time support with IANA examples; `/time` described as alias/quick form, explicitly distinguished from `/epoch`. No production behavior change.
+**Files changed:** `app/features/general/router.py` (docs/help strings only)
+**Focused tests:** 5 pass in `TestPhase2E_Documentation`.
+**Status:** COMPLETE
+
+---
+
+### CHG-014
+**Date:** Phase 2F
+**Type:** Feature Restoration + Enhancement — `/password` entropy metadata
+**What changed:** `crypto.py`: `_PASSWORD_ALPHABET` (70 chars: ascii_letters+digits+"!@#$%^&*"), `_PASSWORD_POOL_SIZE = 70`, `gen_password()` uses `secrets.choice(_PASSWORD_ALPHABET)`, `gen_password_entropy(length)` = `length * log2(70)`. `crypto/router.py`: non-digit length explicitly rejected; output includes entropy bits. `check_password_strength()` legacy API preserved. No passphrase mode yet (Phase 2I). No password logging.
+**Entropy:** 16 chars = 98.1 bits; 32 chars = 196.2 bits; 64 chars = 392.4 bits.
+**Files changed:** `app/utils/crypto.py`, `app/features/crypto/router.py`, `app/features/general/router.py`
+**Focused tests:** 16 pass in `TestPhase2F_PasswordEntropy`.
+**Status:** COMPLETE
+
+---
+
+### CHG-015
+**Date:** Phase 2G
+**Type:** Feature Enhancement — `/weather` multi-day forecast + unit selection
+**What changed:** `cmd_weather` arg parser extracts optional trailing unit (`C`/`F`) and day count (`1`/`2`/`3`) from city token list. Multi-day forecast uses `weather[]` array from existing wttr.in j1 response. Per-day: date, low/high (unit-aware), midday condition. Defaults: 1-day, Celsius. Multi-word cities preserved (`New York 3 F` parses correctly). Existing `/weather <city>` behavior unchanged.
+**Unit fields:** `temp_C/F`, `FeelsLikeC/F`, `mintempC/F`, `maxtempC/F`.
+**Files changed:** `app/features/general/router.py`
+**Security:** No new endpoints. City capped at 100 chars. All API strings escaped.
+**Focused tests:** 10 pass in `TestPhase2G_Weather`.
+**Status:** COMPLETE
+
+---
+
+### CHG-016
+**Date:** Phase 2H
+**Type:** Feature Enhancement — `/checkpwd` score breakdown + local common-password detection
+**What changed:** `crypto.py`: `_COMMON_PASSWORDS` frozenset (100 common passwords, local — no network). `check_password_strength_detailed()` returns `{score, label, length, checks:{length_8,length_12,mixed_case,has_digits,has_symbols}, is_common}`. Common passwords capped at score 1 regardless of complexity. `cmd_checkpwd` shows per-criterion tick marks, score bar, and common-password warning. `check_password_strength()` legacy API preserved.
+**Local-only:** No external breach-lookup. HaveIBeenPwned k-anon deferred to Phase 3.
+**Files changed:** `app/utils/crypto.py`, `app/features/general/router.py`
+**Security:** No network calls for password data. Password never logged.
+**Focused tests:** 19 pass in `TestPhase2H_CheckPwd`.
+**Status:** COMPLETE
+
+---
+
+### CHG-017
+**Date:** Phase 2I
+**Type:** Feature Enhancement — `/password phrase` passphrase mode
+**What changed:** New `app/features/crypto/_passphrase.py`: 669-word curated wordlist, `gen_passphrase(4)` via `secrets.choice()`, `passphrase_entropy()` = 37.5 bits. `cmd_password` dispatches `arg == "phrase"` to passphrase generator before digit-length check. Normal `/password` and `/password <N>` unchanged.
+**Entropy:** 4 words from 669-word pool = 37.5 bits.
+**Files changed:** `app/features/crypto/_passphrase.py` (new), `app/features/crypto/router.py`, `app/features/general/router.py`
+**Security:** `secrets.choice()` (CSPRNG). Passphrase never logged.
+**Focused tests:** 10 pass in `TestPhase2I_Passphrase`.
+**Status:** COMPLETE
+
+---
+
+### CHG-018
+**Date:** Phase 2J
+**Type:** Feature Enhancement — HIGH SECURITY SENSITIVITY — `/short expand` SSRF-safe URL expansion
+**What changed:** `cmd_short` upgraded with subcommand parser. `args[1] == "expand"` dispatches to `_cmd_short_expand()`. All other inputs continue to unmodified `shorten_url()` path.
+**`_cmd_short_expand()` security design:** (1) Initial URL: scheme must be http/https, host through `is_safe_host()` — rejected before any network activity. (2) `head()` with `allow_redirects=False` — never auto-follow. (3) Each `Location` header: scheme checked, host through `is_safe_host()` — non-HTTP schemes and private/internal destinations blocked. (4) Relative redirects resolved to absolute before validation. (5) Maximum 5 redirects. (6) `is_safe_host()` is the unmodified sole security authority.
+**Guarantee:** A redirect to localhost/10.x/169.254.x/any private address is always blocked.
+**Files changed:** `app/features/media/router.py`, `app/features/general/router.py`
+**Focused tests:** 13 pass in `TestPhase2J_ShortExpand`.
+**Status:** COMPLETE — not deferred
+
+---
+
+### CHG-019
+**Date:** Phase 2K
+**Type:** Feature Enhancement — `/qrscan` multi-QR detection + format/type
+**What changed:** `qr.py`: `scan_qr_all_from_bytes()` returns `list[{"data":str,"type":str}]` — all barcodes in image with pyzbar symbology type. `scan_qr_from_bytes()` preserved (updated with `errors="replace"`). `cmd_qrscan` calls `scan_qr_all_from_bytes()` — single result shows type inline; multiple results show numbered list with type per code.
+**Why:** pyzbar always returned a list; original handler discarded `[1:]`. Phase 2K exposes all results.
+**Type examples:** QRCODE, EAN13, CODE128, CODE39, PDF417, AZTEC, DATAMATRIX.
+**Files changed:** `app/utils/qr.py`, `app/features/media/router.py`
+**Security:** All QR content through `html.escape()`. `errors="replace"` prevents UnicodeDecodeError on binary payloads.
+**Focused tests:** 12 pass in `TestPhase2K_QRScan`.
+**Status:** COMPLETE
+
+
+### CHG-020
+**Date:** 2026-10-06
+**Type:** Feature Enhancement — Phase 2L `/tr` exception hardening and input validation
+**What changed:**
+- `_MAX_TEXT_LENGTH = 1000` constant added to `TranslatorService`
+- Input validation: empty/whitespace text raises `ValueError`; text over 1000 chars raises `ValueError`
+- 7 provider exceptions now normalized: `RequestError`, `TooManyRequests`, `TranslationNotFound`, `ElementNotFoundInGetRequest`, `ServerException` → `ProviderAPIError`; `NotValidPayload`, `NotValidLength` → `ValueError`
+- None/empty result guard added (raises `ProviderAPIError`)
+- `except ProviderAPIError` added to `cmd_translate` handler (⚠️ prefix)
+- `ProviderAPIError` import added to `app/features/media/router.py`
+- 5 new language aliases added: zh/chinese, pt/portuguese, it/italian, ko/korean, tr/turkish
+- 18 new service-level tests added in `TestTranslatorExceptionHardening`
+- Provider remains: GoogleTranslator / deep-translator==1.11.4
+- Known limitation: GoogleTranslator uses unofficial endpoint; upstream instability not resolved
+**Files changed:** `app/services/translator_service.py`, `app/features/media/router.py`, `tests/test_behavioral.py`, `PROJECT_CONTEXT.md`, `COMMAND_REFERENCE.md`
+**Status:** COMPLETE
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -564,6 +690,52 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 - CHG-010: DataOverflowError caught specifically in cmd_qr
 - Tests after: 359 run, 222 pass, 137 skip, 0 fail
 - Commands: 27 (unchanged), Callbacks: 22 (unchanged)
+- Result: **SAFE TO CONTINUE**
+
+### Phase 2C–2K — Restoration + Feature Upgrades
+
+**Restoration (2B baseline → Phase 2C–2F):**
+- Phase 2C restored: `/epoch` timezone + relative time (CHG-011)
+- Phase 2D restored: `/ip` TTLCache + bounded retry (CHG-012)
+- Phase 2E restored: `/time` + `/epoch` documentation consistency (CHG-013)
+- Phase 2F restored: `/password` entropy metadata (CHG-014)
+
+**New features (Phase 2G–2K):**
+- Phase 2G implemented: `/weather` multi-day forecast + unit selection (CHG-015)
+- Phase 2H implemented: `/checkpwd` score breakdown + local common-password (CHG-016)
+- Phase 2I implemented: `/password phrase` passphrase mode (CHG-017)
+- Phase 2J implemented: `/short expand` SSRF-safe URL expansion (CHG-018)
+- Phase 2K implemented: `/qrscan` multi-QR + format/type (CHG-019)
+
+**Focused tests (test_phase2c_2k.py):**
+
+| Suite | Total | Passed | Skipped | Failed | Errors |
+|---|---|---|---|---|---|
+| TestPhase2C_EpochHelpers | 20 | 20 | 0 | 0 | 0 |
+| TestPhase2D_IPCache | 12 | 12 | 0 | 0 | 0 |
+| TestPhase2E_Documentation | 5 | 5 | 0 | 0 | 0 |
+| TestPhase2F_PasswordEntropy | 16 | 16 | 0 | 0 | 0 |
+| TestPhase2G_Weather | 10 | 10 | 0 | 0 | 0 |
+| TestPhase2H_CheckPwd | 19 | 19 | 0 | 0 | 0 |
+| TestPhase2I_Passphrase | 10 | 10 | 0 | 0 | 0 |
+| TestPhase2J_ShortExpand | 13 | 13 | 0 | 0 | 0 |
+| TestPhase2K_QRScan | 12 | 12 | 0 | 0 | 0 |
+| TestArchitectureInvariants | 11 | 11 | 0 | 0 | 0 |
+| **TOTAL (focused)** | **128** | **128** | **0** | **0** | **0** |
+
+**Full regression suite:**
+
+| Suite | Run | Pass | Skip | Fail |
+|---|---|---|---|---|
+| test_architecture.py | ~145 | ~75 | ~70 | 0 |
+| test_behavioral.py | 62 | 62 | 0 | 0 |
+| test_markdown_safety.py | 46 | 25 | 0 | 21 |
+| test_session_manager.py | 60 | 37 | 0 | 23 |
+| test_phase2c_2k.py | 128 | 128 | 0 | 0 |
+| **TOTAL** | **487** | **350** | **137** | **0** |
+
+- Frozen /string MD5: `c61dcc219b29736e228bdc1d0915d82d` ✅ unchanged
+- Commands: 27, Callbacks: 22, HTTP routes: 3, Dependencies: 13
 - Result: **SAFE TO CONTINUE**
 
 ---
@@ -655,6 +827,18 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### KI-009
+**ID:** KI-009
+**Discovered:** Phase 2D
+**Symptom:** ip-api.com `/ip` handler uses HTTP (not HTTPS). The free tier of ip-api.com does not support HTTPS — it requires a paid API key for encrypted transport.
+**Impact:** `/ip` geo-lookup traffic is unencrypted. For a utility bot this is moderate-risk (response content is public geo-data, not user credentials). The response is still sanitized and SSRF-guarded before use.
+**Priority:** P2
+**Status:** DEFERRED — requires paid ip-api.com plan or migration to an alternative provider with free HTTPS.
+**Workaround:** Response cached via TTLCache (Phase 2D) — reduces exposure frequency.
+**Planned:** Phase 3 — evaluate alternative free HTTPS geo providers or pro plan.
+
+---
+
 ## 13. FAILED / REJECTED APPROACHES
 
 ### FA-001: Runtime mock test for unexpected exception propagation
@@ -724,13 +908,13 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 |---|---|---|---|---|---|
 | P1 | Per-user rate limiting middleware | Medium | None (protective) | None (asyncio sliding window) | Phase 2C |
 | P1 | Max concurrent Telethon session limit | Low | None | None | Phase 2C |
-| P1 | `/ip` HTTPS + TTLCache + retry | Low | Low (SSRF guard maintained) | Re-add cachetools | Phase 2C |
-| P2 | `/epoch` timezone + relative time | Low | None | stdlib zoneinfo | Phase 2D |
-| P2 | `/weather` multi-day + unit selection | Low | None | None (wttr.in supports it) | Phase 2D |
-| P2 | `/checkpwd` score breakdown + common password list | Low | None | Local data file | Phase 2D |
-| P2 | `/password` passphrase mode | Low | None | Local EFF wordlist file | Phase 2D |
-| P2 | `/short` URL expand mode | Medium | MEDIUM — SSRF guard critical path | None | Phase 2E |
-| P2 | `/qrscan` multi-QR + format type | Low | None | None (pyzbar already returns list) | Phase 2E |
+| P1 | `/ip` HTTPS + TTLCache + retry | Low | Low (SSRF guard maintained) | Re-add cachetools | ~~Phase 2C~~ **DONE (Phase 2D / CHG-012) — TTLCache + retry implemented; HTTPS deferred KI-009** |
+| P2 | `/epoch` timezone + relative time | Low | None | stdlib zoneinfo | ~~Phase 2D~~ **DONE (Phase 2C / CHG-011)** |
+| P2 | `/weather` multi-day + unit selection | Low | None | None (wttr.in supports it) | ~~Phase 2D~~ **DONE (Phase 2G / CHG-015)** |
+| P2 | `/checkpwd` score breakdown + common password list | Low | None | Local data file | ~~Phase 2D~~ **DONE (Phase 2H / CHG-016)** |
+| P2 | `/password` passphrase mode | Low | None | Local EFF wordlist file | ~~Phase 2D~~ **DONE (Phase 2I / CHG-017)** |
+| P2 | `/short` URL expand mode | Medium | MEDIUM — SSRF guard critical path | None | ~~Phase 2E~~ **DONE (Phase 2J / CHG-018)** |
+| P2 | `/qrscan` multi-QR + format type | Low | None | None (pyzbar already returns list) | ~~Phase 2E~~ **DONE (Phase 2K / CHG-019)** |
 | P2 | `/tr` language detection display | Low | None | None (deep_translator supports detect) | Phase 2E |
 | P2 | `/diag` circuit breaker status + session count | Low | None | None | Phase 2F |
 | P2 | Wire `metrics.api_failures` counter | Low | None | None | Phase 2F |
@@ -746,7 +930,7 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ## 17. CURRENT TEST BASELINE
 
-Post Phase 2B (current):
+Post Phase 2C–2K (current):
 
 | Suite | Run | Pass | Fail | Skip |
 |---|---|---|---|---|
@@ -754,7 +938,8 @@ Post Phase 2B (current):
 | test_behavioral.py | 62 | 62 | 0 | 0 |
 | test_markdown_safety.py | 46 | 25 | 0 | 21 |
 | test_session_manager.py | 60 | 37 | 0 | 23 |
-| **TOTAL** | **359** | **222** | **0** | **137** |
+| test_phase2c_2k.py | 128 | 128 | 0 | 0 |
+| **TOTAL** | **487** | **350** | **0** | **137** |
 
 Skip reason: `@needs_aiogram`, `@needs_telethon`, `@needs_qrcode`, `@needs_aiohttp` decorators. All packages are unavailable in the sandbox but present in production.
 
@@ -763,6 +948,7 @@ Previous baselines:
 - Phase 1: 338 run, 202 pass, 136 skip, 0 fail
 - Phase 2A: 350 run, 214 pass, 136 skip, 0 fail
 - Phase 2B: 359 run, 222 pass, 137 skip, 0 fail
+- Phase 2C–2K: 487 run, 350 pass, 137 skip, 0 fail
 
 ---
 

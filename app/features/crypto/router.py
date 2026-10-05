@@ -16,10 +16,36 @@ async def cmd_uuid(message: Message):
 async def cmd_password(message: Message):
     args = message.text.split()
     length = 16
-    if len(args) > 1 and args[1].isdigit():
-        length = max(8, min(64, int(args[1])))
+
+    if len(args) > 1:
+        arg = args[1]
+        # Phase 2I: passphrase mode
+        if arg.lower() == "phrase":
+            from app.features.crypto._passphrase import gen_passphrase, passphrase_entropy
+            phrase = gen_passphrase()
+            ent = passphrase_entropy()
+            await message.reply(
+                f"🔐 **Passphrase (4 words):**\n`{phrase}`\n\n"
+                f"📊 **Entropy:** ~{ent:.1f} bits",
+                parse_mode="Markdown",
+            )
+            return
+        if not arg.isdigit():
+            await message.reply(
+                "❌ **Invalid length.** Length must be a number between 8 and 64.\n"
+                "*Example:* `/password 20`",
+                parse_mode="Markdown",
+            )
+            return
+        length = max(8, min(64, int(arg)))
+
     pwd = crypto.gen_password(length)
-    await message.reply(f"🔑 **High-Entropy Password ({length} chars):**\n`{pwd}`", parse_mode="Markdown")
+    entropy = crypto.gen_password_entropy(length)
+    await message.reply(
+        f"🔑 **High-Entropy Password ({length} chars):**\n`{pwd}`\n\n"
+        f"📊 **Entropy:** ~{entropy:.1f} bits ({crypto._PASSWORD_POOL_SIZE}-char alphabet)",
+        parse_mode="Markdown",
+    )
 
 @router.message(Command("hash"))
 async def cmd_hash(message: Message):

@@ -37,24 +37,27 @@
 
 ---
 
-### `/epoch [value]`
+### `/epoch [value] [timezone]`
 
-**Purpose:** Convert between Unix timestamp and ISO UTC date, or show current epoch.
+**Purpose:** Bidirectional timestamp converter with relative time and IANA timezone support. (Phase 2C)
 **Input:**
-- None → current epoch + formatted UTC
-- Integer → UTC date for that timestamp
-- ISO date string (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) → Unix epoch
-**Output:** Timestamp ↔ UTC date conversion result
+- None → current epoch + formatted UTC + usage hint
+- Integer → UTC date + relative time string (e.g. "2 days ago"); prefix `-` for pre-1970
+- ISO date string (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) → Unix epoch + relative time
+- Optional trailing IANA timezone (e.g. `America/New_York`) → adds local time
+**Output:** Timestamp ↔ UTC date + relative time; optional timezone display
 **Examples:**
-- `/epoch` → `1700000000` + `2023-11-14 22:13:20 UTC`
-- `/epoch 1700000000` → `2023-11-14 22:13:20 UTC`
-- `/epoch 2024-01-01` → Unix epoch for that date
-**Errors:** `❌ Invalid Date or Timestamp format.` on parse failure
-**Related buttons:** None
+- `/epoch` → current epoch + UTC
+- `/epoch 1700000000` → UTC date + relative time
+- `/epoch 2024-01-01` → Unix epoch + relative time
+- `/epoch 1700000000 America/New_York` → UTC + local time
+**Errors:**
+- `❌ Unknown timezone: <tz>` on invalid IANA name (ZoneInfoNotFoundError)
+- `❌ Invalid Date or Timestamp format.` on parse failure
+**Related buttons:** Developer Tools category
 **Category:** Developer Tools (GeneralTools)
-**Dependencies:** stdlib `time`, `datetime`
+**Dependencies:** stdlib `time`, `datetime`, `zoneinfo`
 
----
 
 ### `/urlen <text>`
 
@@ -91,18 +94,25 @@
 
 ### `/checkpwd <password>`
 
-**Purpose:** Evaluate password strength using character composition scoring.
-**Input:** Password string
-**Output:** Strength label: "Very Strong 🔒", "Strong ✅", "Moderate ⚠️", or "Weak ❌"
+**Purpose:** Evaluate password strength with per-criterion breakdown and local common-password detection. (Phase 2H)
+**Input:** Password string (not logged, not stored)
+**Output:** Score bar, per-criterion ticks, and common-password warning if applicable
+**Criteria checked:**
+- ✅/❌ At least 8 characters
+- ✅/❌ At least 12 characters
+- ✅/❌ Mixed case (upper + lower)
+- ✅/❌ Contains digits
+- ✅/❌ Contains symbols
+**Score labels:** Very Strong 🔒 (5), Strong ✅ (4), Moderate ⚠️ (3), Weak ❌ (0-2)
+**Common password detection:** Local frozenset of 100 most common passwords. Match → capped at Weak regardless of complexity. Case-insensitive. No external network call.
 **Examples:**
-- `/checkpwd abc` → `Weak ❌`
-- `/checkpwd MyP@ssw0rd!2024` → `Very Strong 🔒`
+- `/checkpwd abc` → Weak ❌ (score 0/5, breakdown shown)
+- `/checkpwd MyP@ssw0rd!2024` → Very Strong 🔒 (score 5/5)
+- `/checkpwd password123` → Weak ❌ + ⚠️ commonly used password
 **Errors:** `❌ Usage: /checkpwd <password>` if no argument
-**Related buttons:** None
 **Category:** Developer Tools (GeneralTools)
-**Dependencies:** `app/utils/crypto.py`
+**Dependencies:** stdlib only (local common-password list)
 
----
 
 ### `/ua`
 
@@ -156,26 +166,28 @@
 
 ---
 
-### `/weather <city_name>`
+### `/weather <city> [days] [unit]`
 
-**Purpose:** Show current weather conditions for a city.
-**Input:** City name (max 100 characters)
-**Output:** Temperature (°C), feels-like, condition, humidity, wind speed (HTML-formatted)
+**Purpose:** Show current weather and optional multi-day forecast with unit selection. (Phase 2G)
+**Input:** City name + optional day count (1-3) + optional unit (C or F)
+**Argument parsing:** Trailing `C`/`F` = unit; trailing `1`/`2`/`3` = day count; remaining tokens = city name
+**Defaults:** 1-day (current conditions only), Celsius
+**Output:** Temperature, feels-like, condition, humidity, wind; optional N-day forecast
 **Examples:**
-- `/weather London` → weather card for London
-- `/weather New York` → weather for New York
+- `/weather London` → current conditions (Celsius)
+- `/weather London F` → current conditions (Fahrenheit)
+- `/weather London 3` → current + 2-day forecast (Celsius)
+- `/weather London 3 F` → current + 2-day forecast (Fahrenheit)
+- `/weather New York 3 F` → multi-word city supported
 - `/weather London, UK` → more specific (recommended for ambiguous names)
 **Errors:**
-- `❌ Usage: /weather <city_name>` if no argument
+- `❌ Usage: /weather <city> [days] [C|F]` if no city
 - `❌ City name too long.` if > 100 chars
-- `❌ Location not found.` on non-JSON response (city not found)
-- `❌ Unexpected response from weather service.` on schema mismatch
-- `⏱️ Weather service timed out.` on 10s timeout
-**Related buttons:** None
-**Category:** Web & Utilities (GeneralTools)
-**Dependencies:** `bootstrap_ref.http_session`, `wttr.in`
+- `❌ Location <city> not found.` on city not found
+- `❌ Weather service is temporarily unavailable.` on HTTP error
+**Category:** Network Tools (GeneralTools)
+**Dependencies:** wttr.in HTTPS (j1 format, no new API)
 
----
 
 ### `/id`
 
@@ -223,21 +235,25 @@
 
 ---
 
-### `/password [length]`
+### `/password [length|phrase]`
 
-**Purpose:** Generate a high-entropy random password.
-**Input:** Optional integer length (8–64, default 16)
-**Output:** Password string (letters + digits + `!@#$%^&*`)
+**Purpose:** Generate high-entropy cryptographic password with entropy metadata, or a 4-word passphrase. (Phase 2F/2I)
+**Input:** Optional integer length (8-64) or the word "phrase"
+**Default length:** 16 characters
+**Alphabet:** 70 chars — `ascii_letters + digits + "!@#$%^&*"` — CSPRNG via `secrets.choice()`
+**Entropy formula:** `length × log₂(70)` bits
+**Passphrase mode:** `/password phrase` → 4 random words from 669-word embedded wordlist (~37.5 bits)
 **Examples:**
-- `/password` → 16-char password
-- `/password 32` → 32-char password
-- `/password 5` → clamped to 8-char password
-**Errors:** None (invalid length falls back to default 16)
-**Related buttons:** None
-**Category:** Developer Tools (CryptoTools)
-**Dependencies:** `app/utils/crypto.py`, stdlib `secrets`
+- `/password` → 16-char password + entropy (~98.1 bits)
+- `/password 32` → 32-char password + entropy
+- `/password 5` → clamped to 8-char minimum
+- `/password phrase` → "loan base even pave" + entropy (~37.5 bits)
+**Errors:**
+- `❌ Invalid length.` if argument is not a digit or "phrase"
+**Security:** Password never logged. `secrets.choice()` is CSPRNG.
+**Category:** Crypto Tools (CryptoTools)
+**Dependencies:** stdlib `secrets`, `string`, `math`
 
----
 
 ### `/hash <text>`
 
@@ -316,21 +332,35 @@
 
 ---
 
-### `/short <url>`
+### `/short <url>` / `/short expand <url>`
 
-**Purpose:** Shorten a URL using a multi-provider failover shortener.
-**Input:** URL string
-**Output:** Shortened URL (HTML-formatted)
-**Examples:**
-- `/short https://www.example.com/very/long/path?with=params` → `https://cleanuri.com/xyz`
-**Errors:**
-- `❌ Usage: /short <url>` if no argument
-- `⚠️ Service is temporarily unavailable.` if both providers fail
-**Related buttons:** None
-**Category:** Web & Utilities (shown in menu) / MediaTools (actual module)
-**Dependencies:** `ShortenerService`, `CleanURIProvider`, `VGdURLProvider`
+**Purpose:** Shorten a URL, or safely expand/trace a short URL to its final destination. (Phase 2J)
 
----
+**Subcommand: Shorten (existing, unchanged)**
+- Input: any valid URL
+- Output: shortened URL via CleanURI → v.gd failover
+- Examples: `/short https://www.example.com/very/long/path?with=params` → `https://cleanuri.com/xyz`
+
+**Subcommand: Expand (Phase 2J)**
+- Input: `expand` keyword + short URL
+- Output: hop-by-hop redirect chain + final destination domain
+- SSRF protection: initial URL AND every redirect destination validated via `is_safe_host()`
+- Never auto-follows redirects — manual HEAD with `allow_redirects=False`
+- Non-HTTP schemes (e.g. `file://`, `ftp://`) blocked
+- Redirects to private/internal addresses blocked
+- Relative redirects resolved to absolute before validation
+- Max 5 redirects in chain
+- Examples: `/short expand https://bit.ly/example` → shows redirect chain to final destination
+- Errors: `⛔ Redirect to private/internal host blocked` / `⛔ Redirect to non-HTTP scheme blocked`
+
+**General errors:**
+- `❌ Usage: /short <url> or /short expand <url>` if no arguments
+- `❌ Only http:// and https:// URLs are supported.`
+- `❌ Invalid URL format.`
+- `❌ Private/reserved host in URL — cannot expand.`
+**Category:** Media/URL Tools (MediaTools)
+**Dependencies:** stdlib `urllib.parse`; `aiohttp` for expand
+
 
 ### `/tr <lang> [text]`
 
@@ -343,11 +373,16 @@
 - Reply to English text + `/tr hi` → Hindi translation
 - `/tr es Hello, how are you?` → Spanish translation
 - `/tr french Hello` → alias-resolved to `fr`
-**Supported aliases:** hin/hindi, eng/english, sp/spanish, ur/urdu, fr/french, ar/arabic, ru/russian, ja/japanese, de/german
+**Max text:** 1000 characters
+**Supported aliases:** hin/hindi, eng/english, sp/spanish, ur/urdu, fr/french, ar/arabic, ru/russian, ja/japanese, de/german, zh/chinese, pt/portuguese, it/italian, ko/korean, tr/turkish
 **Errors:**
 - `❌ Reply to text or format: /tr <lang> <text>` if no text found
-- `⏱️ Translation timed out...` on 15s timeout
-- `❌ Language code 'X' is not supported.` on invalid lang
+- `❌ No text to translate.` if text is empty or whitespace
+- `❌ Text too long. Maximum 1000 characters.` if text exceeds limit
+- `⏱️ Translation timed out after 15 seconds.` on timeout
+- `❌ Language 'X' is not supported.` on invalid lang
+- `⚠️ Translation service is busy. Please try again in a moment.` on rate limit
+- `⚠️ Translation service is temporarily unavailable.` on provider error
 **Related buttons:** None
 **Category:** Media & OCR (MediaTools)
 **Dependencies:** `TranslatorService`, `deep_translator`
@@ -374,18 +409,22 @@
 
 ### `/qrscan`
 
-**Purpose:** Decode a QR code from an image.
-**Input:** Must be sent as a reply to a photo containing a QR code
-**Output:** Decoded QR content in HTML `<code>` block, or "No QR code detected."
+**Purpose:** Decode all QR codes (and other barcodes) in a replied-to photo, showing format/type per code. (Phase 2K)
+**Input:** Reply to a photo message with `/qrscan`
+**Output:**
+- Single code: decoded content + barcode type (e.g. `QRCODE`, `EAN13`, `CODE128`)
+- Multiple codes: numbered list, each with type label and decoded content
+- All content escaped with `html.escape()` — arbitrary QR payloads safe to display
+**Barcode types detected:** QRCODE, EAN13, EAN8, UPCA, CODE128, CODE39, ITF, PDF417, AZTEC, DATAMATRIX (whatever pyzbar supports)
 **Examples:**
-- Reply to QR image + `/qrscan` → decoded URL or text
+- Reply to QR image + `/qrscan` → `✅ Decoded QR Output (QRCODE): <content>`
+- Reply to image with 3 barcodes + `/qrscan` → `✅ 3 codes detected: #1 (QRCODE)... #2 (EAN13)...`
 **Errors:**
 - `❌ Reply to a QR photo message with /qrscan.` if not a reply to photo
-**Related buttons:** None
-**Category:** Media & OCR (MediaTools)
-**Dependencies:** `app/utils/qr.py`, `pyzbar`, `Pillow`, `libzbar0` (system)
+- `❌ No QR code detected in image.` if pyzbar finds nothing
+**Category:** Media Tools (MediaTools)
+**Dependencies:** `pyzbar`, `Pillow`; system library `libzbar0`
 
----
 
 ### `/string`
 

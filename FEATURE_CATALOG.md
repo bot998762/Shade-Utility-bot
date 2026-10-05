@@ -47,8 +47,8 @@
 
 ### /epoch
 
-**Current purpose:** Convert between Unix timestamp and ISO UTC date, or show current epoch.
-**Commands:** `/epoch [timestamp|YYYY-MM-DD]`
+**Current purpose:** Bidirectional timestamp converter with relative time and IANA timezone support. (Phase 2C — UPGRADED)
+**Commands:** `/epoch [timestamp|YYYY-MM-DD] [IANA_timezone]`
 **Current UI:** Reply with timestamp↔date result. No buttons.
 **Current implementation:** `message.text.split(maxsplit=1)`. If no arg: returns current epoch + formatted UTC. If numeric: converts to UTC date. If ISO string: converts to Unix epoch. Uses `datetime.fromisoformat()` and `datetime.utcfromtimestamp()`.
 **Dependencies:** stdlib `time`, `datetime`.
@@ -98,7 +98,7 @@
 
 ### /checkpwd
 
-**Current purpose:** Evaluate password strength by character composition scoring.
+**Current purpose:** Password strength with per-criterion breakdown and local common-password detection. (Phase 2H — UPGRADED)
 **Commands:** `/checkpwd <password>`
 **Current UI:** Reply with strength label.
 **Current implementation:** Scores 0–5 based on: length≥8, length≥12, mixed case, digits, special chars. Returns "Very Strong", "Strong", "Moderate", or "Weak" label with emoji.
@@ -106,7 +106,7 @@
 **Input:** Any password string.
 **Output:** Strength label string.
 **Current capability:** Basic 5-point heuristic scoring.
-**Current limitations:** No entropy calculation. No breach database check. No dictionary attack simulation. No zxcvbn-style analysis. The password itself is visible in chat (unavoidable in Telegram).
+**Current capabilities (Phase 2H):** Per-criterion breakdown (length_8, length_12, mixed_case, has_digits, has_symbols). Local common-password detection (100-entry frozenset, case-insensitive). Common passwords capped at Weak regardless of complexity. Score bar display. No external breach-lookup (HaveIBeenPwned deferred to Phase 3). Password visible in Telegram chat (unavoidable).
 **Current security:** Password appears in chat message. This is inherent to Telegram bot interaction — cannot be hidden.
 **Current performance:** Immediate.
 **Status:** Working.
@@ -166,14 +166,14 @@
 
 ### /weather
 
-**Current purpose:** Show live weather for a city.
-**Commands:** `/weather <city_name>`
+**Current purpose:** Show current weather + optional multi-day forecast with unit selection. (Phase 2G — UPGRADED)
+**Commands:** `/weather <city> [days:1-3] [unit:C|F]`
 **Current UI:** "Fetching..." status → edited with HTML weather card.
 **Current implementation:** City name length-capped at 100 chars. `aiohttp GET` to `https://wttr.in/{city}?format=j1`. JSON parsed manually with KeyError/IndexError guard. All fields escaped with `html.escape()`. `parse_mode="HTML"`.
 **Dependencies:** `bootstrap_ref.http_session`, `wttr.in`.
 **Input:** City name string (max 100 chars).
 **Output:** Temperature (C), feels-like, condition, humidity, wind speed.
-**Current capability:** Live weather via wttr.in.
+**Current capability (Phase 2G):** Current conditions + up to 3-day forecast. Unit selection (Celsius/Fahrenheit). Multi-word city names. Forecast uses `weather[]` array already in wttr.in j1 response.
 **Current limitations:** wttr.in is a public service with no API key or SLA. Non-JSON response (404/city not found) is handled as "city not found." No SSRF risk (URL is hardcoded). No unit selection (always Celsius). No forecast — current conditions only.
 **Current security:** City name is `quote_plus`-encoded before use in URL. Response fields HTML-escaped. No injection risk.
 **Current performance:** 10s timeout. Single request.
@@ -248,13 +248,13 @@
 
 ### /password
 
-**Current purpose:** Generate a high-entropy random password.
-**Commands:** `/password [length]`
+**Current purpose:** Generate high-entropy password with entropy metadata, or a 4-word passphrase. (Phase 2F/2I — UPGRADED)
+**Commands:** `/password [length|phrase]`
 **Current implementation:** `secrets.choice()` over alphabet (`ascii_letters + digits + "!@#$%^&*"`). Length clamped to 8–64. Default 16.
 **Dependencies:** `app/utils/crypto.py`, stdlib `secrets`, `string`.
 **Input:** Optional integer length (8–64).
 **Output:** Password string in Markdown backtick block.
-**Current capability:** Single password with length control.
+**Current capability (Phase 2F/2I):** Password with entropy bits output. Non-digit length explicitly rejected. Passphrase mode: `/password phrase` → 4-word passphrase from 669-word embedded wordlist (~37.5 bits entropy).
 **Current limitations:** Fixed character set. No custom charset. No passphrase mode. No pronounceable mode. Password visible in chat.
 **Current security:** Uses `secrets` module (cryptographically secure PRNG).
 **Current performance:** Immediate.
@@ -354,14 +354,15 @@
 ### /short
 
 **Current purpose:** Shorten a URL using a multi-provider failover engine.
-**Commands:** `/short <url>`
+**Commands:** `/short <url>` (shorten) or `/short expand <url>` (trace, Phase 2J)
 **Current UI:** HTML reply with shortened URL.
 **Current implementation:** `ShortenerService` → `ProviderFailoverEngine` → `CleanURIProvider` (primary) → `VGdURLProvider` (fallback). Both use text-first response reading (avoids `ContentTypeError`). Result validated to start with `http`. HTML-escaped before display.
 **Dependencies:** `ShortenerService`, `CleanURIProvider`, `VGdURLProvider`, `bootstrap_ref.http_session`.
 **Input:** URL string.
 **Output:** Shortened URL.
 **Current capability:** URL shortening with automatic failover. Two providers.
-**Current limitations:** No input validation (any string accepted, providers may reject). No custom alias. No click tracking. `/short` is registered in `media/router.py` (MediaTools) but shown under Web & Utilities in the menu — category mismatch.
+**Phase 2J addition:** `/short expand <url>` traces a short URL hop-by-hop to final destination. SSRF guard applied to initial URL and every redirect destination. Non-HTTP schemes blocked. Private/internal destinations blocked. Manual HEAD with `allow_redirects=False`. Max 5 redirects. Existing shortening path unmodified.
+**Remaining limitations:** No custom alias. No click tracking. Category mismatch (MediaTools/Web menu) deferred KI-007.
 **Current security:** No SSRF risk (bot sends URL to shortener, doesn't fetch it). Shortened URL HTML-escaped in display.
 **Current performance:** 15s timeout. Single request per provider attempt.
 **Status:** Working. Category label mismatch (cosmetic, not functional).
@@ -404,20 +405,13 @@
 
 ### /qrscan
 
-**Current purpose:** Decode a QR code from an image.
+**Phase 2K — UPGRADED**
+**Current purpose:** Decode all QR codes and barcodes in a photo, showing format/type per code.
 **Commands:** Reply to a QR photo with `/qrscan`
-**Current UI:** "Scanning..." status → edited with decoded text.
-**Current implementation:** Downloads photo. `Image.open(BytesIO(bytes))` → `pyzbar.decode()` → first result's `data.decode('utf-8')`. Output HTML-escaped.
-**Dependencies:** `app/utils/qr.py`, `pyzbar`, `Pillow`, `libzbar0` (system).
-**Input:** Photo containing a QR code (must be replied-to).
-**Output:** Decoded QR content or "No QR code detected."
-**Current capability:** Decodes first QR code found in image.
-**Current limitations:** Only first QR code decoded (multi-QR images return only first). Requires `libzbar0` system library. No barcode support (only QR). UTF-8 decode may fail for binary QR content.
-**Current security:** Output HTML-escaped. No file stored.
-**Current performance:** Immediate after photo download. pyzbar is fast (C extension).
-**Status:** Working.
+**Implementation:** `scan_qr_all_from_bytes()` in `app/utils/qr.py` — returns all pyzbar decoded objects as `[{"data": str, "type": str}]`. Handler branches: single code shows type inline; multiple codes show numbered list with type per entry. `errors="replace"` prevents crash on binary QR payloads. All content through `html.escape()`.
+**Backward compatibility:** `scan_qr_from_bytes()` (legacy) preserved.
+**Supported types:** QRCODE, EAN13, EAN8, UPCA, CODE128, CODE39, ITF, PDF417, AZTEC, DATAMATRIX (pyzbar-dependent).
 
----
 
 ## Feature 4 — session (FROZEN)
 
