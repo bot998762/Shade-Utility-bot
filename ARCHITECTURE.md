@@ -51,7 +51,10 @@ Step 4: Build provider failover engines
 Step 5: Build services
         OCRService(ocr_engine, event_bus)
         ShortenerService(url_engine)
-        TranslatorService()
+        build_google_providers_from_env() → GoogleCloudTranslationProvider pool
+        build_libretranslate_providers_from_env() → LibreTranslateProvider pool
+        TranslationOrchestrator(google_providers + lt_providers)
+        TranslatorService(orchestrator=orchestrator)
         
 Step 6: Register middleware (order matters in aiogram)
         dp.message.middleware(PlatformErrorMiddleware())
@@ -276,14 +279,18 @@ shortener_service.shorten_url(url)
 ### TranslatorService
 ```
 translator_service.translate(text, target_lang)
+  → input validation (empty / too long → ValueError)
   → LANG_ALIASES.get(target_lang.lower(), target_lang.lower())
-  → asyncio.wait_for(
-        loop.run_in_executor(None, _do_translate),
-        timeout=15.0
-    )
-  → GoogleTranslator(source="auto", target=code).translate(text)
-  → raises TimeoutError on 15s
-  → raises ValueError on LanguageNotSupportedException
+  → TranslationOrchestrator.translate(text, target_lang=code)
+      → iterate provider pool (Google Cloud entries first, then LibreTranslate)
+      → skip entry if cooldown or permanently disabled
+      → on UNSUPPORTED_LANGUAGE / INVALID_INPUT → raise immediately (no record_failure call — CHG-022)
+      → on AUTH_ERROR / CONFIG_ERROR → record_failure (sets disabled=True), raise immediately
+      → on TIMEOUT / CONNECTION / RATE_LIMITED / SERVER_ERROR / EMPTY_RESULT / UNKNOWN → record_failure + cooldown + try next
+      → after _FAILURE_THRESHOLD (3) consecutive temporary failures → entry enters 60s cooldown
+      → AUTH_ERROR / CONFIG_ERROR → entry permanently disabled (this process lifetime)
+      → raises ProviderAPIError on exhaustion
+  → handler catches ValueError (user error) or ProviderAPIError (service error)
 ```
 
 ### CircuitBreaker

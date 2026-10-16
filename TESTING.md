@@ -9,10 +9,14 @@
 | File | Tests | Pass | Fail | Skip | Purpose |
 |---|---|---|---|---|---|
 | `tests/test_architecture.py` | 46 | 46 | 0 | 0 | AST/structural/security checks |
-| `tests/test_behavioral.py` | 62 | 62 | 0 | 0 | Logic and data parsing |
+| `tests/test_behavioral.py` | 276 | 178 | 0 | 98 | Logic, data parsing, orchestrator, SSRF |
 | `tests/test_markdown_safety.py` | 46 | 25 | 0 | 21 | Parse mode / escaping |
 | `tests/test_session_manager.py` | 60 | 37 | 0 | 23 | Session manager flows |
-| **TOTAL** | **214** | **170** | **0** | **44** |  |
+| **TOTAL** | **428** | **286** | **0** | **142** |  |
+
+**Note (CHG-022):** The 98 skipped tests in test_behavioral.py require `aiohttp` (not installed in the test container). All 178 that can run without it pass. Zero errors, zero failures.
+
+**Baseline (pre-CHG-022):** test_behavioral.py had 226 tests; CHG-022 appended 50 new tests (276 total).
 
 **44 skips** are graceful: guarded by `@needs_aiogram` or `@needs_telethon` decorators. They do not represent failures — they represent tests that require optional libraries to run.
 
@@ -44,9 +48,12 @@ Pure AST/import/structural tests. No network. No Telegram. No mock of Bot.
 
 ---
 
-### `tests/test_behavioral.py` (62 tests, all pass in isolation)
+### `tests/test_behavioral.py` (276 tests: 178 pass, 98 skip — CHG-022 updated)
 
 Mix of: pure-Python logic tests (no aiogram needed) and aiogram-dependent tests (skipped).
+98 tests are skipped because `aiohttp` is not installed in the test container.
+
+**Original classes (pre-CHG-022):**
 
 | Class | Tests | Skip | What it checks |
 |---|---|---|---|
@@ -64,6 +71,18 @@ Mix of: pure-Python logic tests (no aiogram needed) and aiogram-dependent tests 
 | `TestIdInfoNoneFromUser` | 3 | ~3 | /id and /info handle from_user=None without crash (needs aiogram mock) |
 | `TestSessionSelfCleanup` | ~4 | ~4 | Cleanup removes from ACTIVE_CLIENTS/CS_ACTIVE (needs aiogram) |
 | *(remaining aiogram-dependent)* | ~4 | ~4 | Various handler behavior tests |
+
+**CHG-022 additions (50 new tests across 7 new classes):**
+
+| Class | Tests | Skip | What it checks |
+|---|---|---|---|
+| `TestOrchestratorDefect01Regression` | 5 | 0 | UNSUPPORTED_LANGUAGE/INVALID_INPUT do not increment failure counters; AUTH_ERROR disables provider |
+| `TestOrchestratorCooldownAndRecovery` | 5 | 0 | Cooldown entry/skip/all-in-cooldown/half-open recovery/attempt budget |
+| `TestOrchestratorDuplicateProviderID` | 1 | 0 | Duplicate provider_id results in single _EntryState (documented behavior) |
+| `TestSSRFHardeningLibreTranslate` | 20 | 0 | All previously bypassing vectors now blocked; legitimate endpoints pass; allow_private=True opt-in |
+| `TestSSRFEndpointSafetyFunction` | 11 | 0 | Unit tests for `_is_endpoint_safe()`: IPv4-mapped IPv6, CGNAT, malformed URLs |
+| `TestProviderPoolGapDetection` | 3 | 0 | Gap warnings logged for both LibreTranslate and Google pool builders |
+| `TestIsEndpointSafePublicIPv6` | 3 | 0 | Cloudflare public IPv6 accepted; link-local and unique-local IPv6 blocked |
 
 ---
 
@@ -110,7 +129,10 @@ Tests that verify parse_mode usage and html.escape() application.
 | Functionality | Test coverage |
 |---|---|
 | `/string` output never logged | `TestNoSecretsInLogs` — AST confirmed |
-| SSRF guard correctness | `TestSSRFGuard` — 15 vectors, all passing |
+| SSRF guard correctness | `TestSSRFGuard` — 15 vectors; `TestSSRFHardeningLibreTranslate` — 20 vectors; `TestSSRFEndpointSafetyFunction` — 11 unit tests; `TestIsEndpointSafePublicIPv6` — 3 IPv6 tests |
+| Orchestrator DEFECT-01 (no counter on user errors) | `TestOrchestratorDefect01Regression` — 5 regression tests |
+| Orchestrator cooldown/circuit-breaker | `TestOrchestratorCooldownAndRecovery` — 5 state tests |
+| Provider pool gap/duplicate detection | `TestProviderPoolGapDetection` — 3 tests |
 | Admin fail-closed when ADMIN_ID=0 | `TestAdminCheckAST` — AST confirmed |
 | ACTIVE_CLIENTS and CS_ACTIVE separate | `TestCSActiveSeparation`, `TestSessionFeatureArchitecture` |
 | Shutdown order (SM before string sessions) | `TestShutdownOrderAST` |

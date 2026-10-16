@@ -3809,3 +3809,855 @@ class TestTranslatorExceptionHardening(IsolatedAsyncioTestCase):
             mock_cls.return_value.translate.return_value = "Bonjour"
             result = await self._translate(text="Hello", lang="fr")
         self.assertEqual(result, "Bonjour")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Multi-provider translation architecture tests
+# ---------------------------------------------------------------------------
+
+class _FakeProvider:
+    """Test double for ITranslationProvider."""
+    def __init__(self, pid, result=None, error=None):
+        self.provider_id = pid
+        self._result = result
+        self._error = error
+        self.call_count = 0
+
+    def supported_languages(self):
+        return frozenset()
+
+    async def translate(self, text, target_lang, source_lang="auto"):
+        from app.providers.translation_provider import TranslationResult
+        self.call_count += 1
+        if self._error is not None:
+            raise self._error
+        return TranslationResult(self._result, self.provider_id)
+
+
+class TestTranslationOrchestrator(unittest.IsolatedAsyncioTestCase):
+
+    async def test_single_provider_success(self):
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        p = _FakeProvider("p1", result="Bonjour")
+        orch = TranslationOrchestrator([p])
+        result = await orch.translate("Hello", "fr")
+        self.assertEqual(result, "Bonjour")
+        self.assertEqual(p.call_count, 1)
+
+    async def test_first_fails_second_succeeds(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        p1 = _FakeProvider("p1", error=TranslationError("down", FailureKind.CONNECTION, "p1"))
+        p2 = _FakeProvider("p2", result="Hola")
+        orch = TranslationOrchestrator([p1, p2])
+        result = await orch.translate("Hello", "es")
+        self.assertEqual(result, "Hola")
+        self.assertEqual(p1.call_count, 1)
+        self.assertEqual(p2.call_count, 1)
+
+    async def test_no_failover_on_unsupported_language(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        p1 = _FakeProvider("p1", error=TranslationError("bad lang", FailureKind.UNSUPPORTED_LANGUAGE, "p1"))
+        p2 = _FakeProvider("p2", result="ok")
+        orch = TranslationOrchestrator([p1, p2])
+        with self.assertRaises(ValueError):
+            await orch.translate("Hello", "xyz")
+        self.assertEqual(p2.call_count, 0)
+
+    async def test_no_failover_on_auth_error(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+        p1 = _FakeProvider("p1", error=TranslationError("auth", FailureKind.AUTH_ERROR, "p1"))
+        p2 = _FakeProvider("p2", result="ok")
+        orch = TranslationOrchestrator([p1, p2])
+        with self.assertRaises(ProviderAPIError):
+            await orch.translate("Hello", "fr")
+        self.assertEqual(p2.call_count, 0)
+
+    async def test_all_fail_raises_provider_api_error(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+        p1 = _FakeProvider("p1", error=TranslationError("down", FailureKind.SERVER_ERROR, "p1"))
+        p2 = _FakeProvider("p2", error=TranslationError("down", FailureKind.TIMEOUT, "p2"))
+        orch = TranslationOrchestrator([p1, p2])
+        with self.assertRaises(ProviderAPIError):
+            await orch.translate("Hello", "fr")
+
+    async def test_no_providers_configured(self):
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+        orch = TranslationOrchestrator([])
+        with self.assertRaises(ProviderAPIError):
+            await orch.translate("Hello", "fr")
+
+    async def test_cooldown_entry_skipped(self):
+        import time
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        p1 = _FakeProvider("p1", result="would be called")
+        p2 = _FakeProvider("p2", result="ok")
+        orch = TranslationOrchestrator([p1, p2])
+        orch._states["p1"].cooldown_until = time.monotonic() + 9999
+        result = await orch.translate("Hello", "fr")
+        self.assertEqual(result, "ok")
+        self.assertEqual(p1.call_count, 0)
+
+    async def test_disabled_entry_skipped(self):
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        p1 = _FakeProvider("p1", result="should not be called")
+        p2 = _FakeProvider("p2", result="ok2")
+        orch = TranslationOrchestrator([p1, p2])
+        orch._states["p1"].disabled = True
+        result = await orch.translate("Hello", "fr")
+        self.assertEqual(result, "ok2")
+        self.assertEqual(p1.call_count, 0)
+
+    async def test_rate_limit_error_message(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+        p1 = _FakeProvider("p1", error=TranslationError("429", FailureKind.RATE_LIMITED, "p1"))
+        orch = TranslationOrchestrator([p1])
+        with self.assertRaises(ProviderAPIError) as ctx:
+            await orch.translate("Hello", "fr")
+        self.assertIn("busy", str(ctx.exception).lower())
+
+    async def test_unexpected_exception_handled(self):
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+
+        class BrokenProvider:
+            provider_id = "broken"
+            def supported_languages(self): return frozenset()
+            async def translate(self, *a, **kw): raise RuntimeError("unexpected!")
+
+        orch = TranslationOrchestrator([BrokenProvider()])
+        with self.assertRaises(ProviderAPIError):
+            await orch.translate("Hello", "fr")
+
+
+class TestTranslatorServiceWithOrchestrator(unittest.IsolatedAsyncioTestCase):
+
+    def _make_service(self, providers):
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.services.translator_service import TranslatorService
+        orch = TranslationOrchestrator(providers)
+        return TranslatorService(orchestrator=orch)
+
+    async def test_successful_translation(self):
+        svc = self._make_service([_FakeProvider("p1", result="Ciao")])
+        result = await svc.translate("Hello", "it")
+        self.assertEqual(result, "Ciao")
+
+    async def test_empty_text_rejected_before_provider(self):
+        p = _FakeProvider("p1", result="anything")
+        svc = self._make_service([p])
+        with self.assertRaises(ValueError):
+            await svc.translate("", "fr")
+        self.assertEqual(p.call_count, 0)
+
+    async def test_whitespace_rejected_before_provider(self):
+        p = _FakeProvider("p1", result="anything")
+        svc = self._make_service([p])
+        with self.assertRaises(ValueError):
+            await svc.translate("   ", "fr")
+        self.assertEqual(p.call_count, 0)
+
+    async def test_over_limit_rejected_before_provider(self):
+        p = _FakeProvider("p1", result="anything")
+        svc = self._make_service([p])
+        with self.assertRaises(ValueError):
+            await svc.translate("x" * 1001, "fr")
+        self.assertEqual(p.call_count, 0)
+
+    async def test_at_limit_calls_provider(self):
+        p = _FakeProvider("p1", result="ok")
+        svc = self._make_service([p])
+        result = await svc.translate("x" * 1000, "fr")
+        self.assertEqual(result, "ok")
+        self.assertEqual(p.call_count, 1)
+
+    async def test_alias_hindi(self):
+        p = _FakeProvider("p1", result="नमस्ते")
+        svc = self._make_service([p])
+        result = await svc.translate("hello", "hindi")
+        self.assertEqual(result, "नमस्ते")
+
+    async def test_alias_french(self):
+        p = _FakeProvider("p1", result="Bonjour")
+        svc = self._make_service([p])
+        result = await svc.translate("hello", "french")
+        self.assertEqual(result, "Bonjour")
+
+
+class TestGoogleCloudProviderParsing(unittest.TestCase):
+
+    def _make_provider(self):
+        from app.providers.google_cloud_provider import GoogleCloudTranslationProvider
+        return GoogleCloudTranslationProvider("fake_key", "google_test")
+
+    def test_parse_success(self):
+        p = self._make_provider()
+        body = {"data": {"translations": [{"translatedText": "Hola", "detectedSourceLanguage": "en"}]}}
+        result = p._parse_response(body, 200, "es")
+        self.assertEqual(result.translated_text, "Hola")
+
+    def test_parse_401_auth_error(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response({}, 401, "es")
+        self.assertEqual(ctx.exception.kind, FailureKind.AUTH_ERROR)
+
+    def test_parse_429_rate_limited(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response({}, 429, "es")
+        self.assertEqual(ctx.exception.kind, FailureKind.RATE_LIMITED)
+
+    def test_parse_500_server_error(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response({}, 500, "es")
+        self.assertEqual(ctx.exception.kind, FailureKind.SERVER_ERROR)
+
+    def test_parse_malformed_body(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response({"unexpected": True}, 200, "es")
+        self.assertEqual(ctx.exception.kind, FailureKind.EMPTY_RESULT)
+
+    def test_parse_empty_translation(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        body = {"data": {"translations": [{"translatedText": ""}]}}
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response(body, 200, "es")
+        self.assertEqual(ctx.exception.kind, FailureKind.EMPTY_RESULT)
+
+    def test_build_from_env_empty(self):
+        import os
+        from app.providers.google_cloud_provider import build_google_providers_from_env
+        saved = {k: v for k, v in os.environ.items() if "GOOGLE_TRANSLATE" in k}
+        for k in saved: del os.environ[k]
+        self.assertEqual(build_google_providers_from_env(), [])
+        os.environ.update(saved)
+
+    def test_build_from_env_single(self):
+        import os
+        from app.providers.google_cloud_provider import build_google_providers_from_env
+        os.environ["GOOGLE_TRANSLATE_API_KEY"] = "testkey"
+        try:
+            providers = build_google_providers_from_env()
+            self.assertEqual(len(providers), 1)
+            self.assertEqual(providers[0].provider_id, "google_0")
+        finally:
+            del os.environ["GOOGLE_TRANSLATE_API_KEY"]
+
+    def test_build_from_env_multiple(self):
+        import os
+        from app.providers.google_cloud_provider import build_google_providers_from_env
+        os.environ["GOOGLE_TRANSLATE_API_KEY"] = "key_a"
+        os.environ["GOOGLE_TRANSLATE_API_KEY_1"] = "key_b"
+        try:
+            providers = build_google_providers_from_env()
+            self.assertEqual(len(providers), 2)
+            self.assertEqual(providers[1].provider_id, "google_1")
+        finally:
+            del os.environ["GOOGLE_TRANSLATE_API_KEY"]
+            del os.environ["GOOGLE_TRANSLATE_API_KEY_1"]
+
+
+class TestLibreTranslateProviderParsing(unittest.TestCase):
+
+    def _make_provider(self):
+        from app.providers.libretranslate_provider import LibreTranslateProvider
+        return LibreTranslateProvider("https://lt.example.com", "lt_test")
+
+    def test_parse_success(self):
+        p = self._make_provider()
+        result = p._parse_response({"translatedText": "Hola"}, 200, "es")
+        self.assertEqual(result.translated_text, "Hola")
+
+    def test_parse_403_auth_error(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response({}, 403, "es")
+        self.assertEqual(ctx.exception.kind, FailureKind.AUTH_ERROR)
+
+    def test_parse_429_rate_limited(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response({}, 429, "es")
+        self.assertEqual(ctx.exception.kind, FailureKind.RATE_LIMITED)
+
+    def test_parse_400_unsupported_language(self):
+        from app.providers.translation_provider import TranslationError, FailureKind
+        p = self._make_provider()
+        with self.assertRaises(TranslationError) as ctx:
+            p._parse_response({"error": "Language pair not supported"}, 400, "xyz")
+        self.assertEqual(ctx.exception.kind, FailureKind.UNSUPPORTED_LANGUAGE)
+
+    def test_endpoint_rejects_private_ip(self):
+        import os
+        from app.providers.libretranslate_provider import LibreTranslateProvider
+        os.environ.pop("LIBRETRANSLATE_ALLOW_PRIVATE_ENDPOINTS", None)
+        with self.assertRaises(ValueError):
+            LibreTranslateProvider("http://192.168.1.100:5000", "lt_bad")
+
+    def test_endpoint_accepts_https(self):
+        from app.providers.libretranslate_provider import LibreTranslateProvider
+        p = LibreTranslateProvider("https://translate.example.com", "lt_ok")
+        self.assertEqual(p.provider_id, "lt_ok")
+
+    def test_build_from_env_empty(self):
+        import os
+        from app.providers.libretranslate_provider import build_libretranslate_providers_from_env
+        saved = {k: v for k, v in os.environ.items() if "LIBRETRANSLATE" in k}
+        for k in saved: del os.environ[k]
+        self.assertEqual(build_libretranslate_providers_from_env(), [])
+        os.environ.update(saved)
+
+    def test_build_from_env_single(self):
+        import os
+        from app.providers.libretranslate_provider import build_libretranslate_providers_from_env
+        os.environ["LIBRETRANSLATE_URL"] = "https://lt.example.com"
+        try:
+            providers = build_libretranslate_providers_from_env()
+            self.assertEqual(len(providers), 1)
+        finally:
+            del os.environ["LIBRETRANSLATE_URL"]
+
+
+# =============================================================================
+# CHG-022 Regression Tests
+# =============================================================================
+
+class TestOrchestratorDefect01Regression(unittest.IsolatedAsyncioTestCase):
+    """
+    DEFECT-01 regression: _NO_FAILOVER kinds (UNSUPPORTED_LANGUAGE,
+    INVALID_INPUT) must NOT increment provider failure counters or
+    trigger cooldown.
+    """
+
+    def _make_provider(self, provider_id="p1"):
+        from app.providers.translation_provider import (
+            FailureKind, TranslationError, TranslationResult,
+        )
+        class _P:
+            def __init__(self, pid):
+                self.provider_id = pid
+                self.calls = 0
+                self._kind = FailureKind.UNSUPPORTED_LANGUAGE
+            def supported_languages(self):
+                return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                self.calls += 1
+                raise TranslationError("bad lang", self._kind, self.provider_id)
+        return _P(provider_id)
+
+    async def test_unsupported_language_does_not_increment_failures(self):
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+
+        p = self._make_provider("p1")
+        orch = TranslationOrchestrator([p])
+        state = orch._states["p1"]
+
+        # Call 3 times (threshold is 3) — failures must stay at 0
+        for _ in range(3):
+            with self.assertRaises((ValueError, ProviderAPIError)):
+                await orch.translate("hi", "xyz")
+
+        self.assertEqual(state.consecutive_failures, 0,
+            "UNSUPPORTED_LANGUAGE must not increment consecutive_failures")
+        self.assertFalse(state.disabled,
+            "UNSUPPORTED_LANGUAGE must not disable provider")
+        self.assertEqual(state.cooldown_until, 0.0,
+            "UNSUPPORTED_LANGUAGE must not set cooldown_until")
+
+    async def test_invalid_input_does_not_increment_failures(self):
+        from app.providers.translation_provider import FailureKind, TranslationError
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+
+        class _P:
+            provider_id = "p_inv"
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                raise TranslationError("invalid", FailureKind.INVALID_INPUT, self.provider_id)
+
+        orch = TranslationOrchestrator([_P()])
+        state = orch._states["p_inv"]
+
+        for _ in range(3):
+            with self.assertRaises((ValueError, ProviderAPIError)):
+                await orch.translate("hi", "en")
+
+        self.assertEqual(state.consecutive_failures, 0)
+        self.assertEqual(state.cooldown_until, 0.0)
+
+    async def test_unsupported_language_raises_value_error(self):
+        from app.providers.translation_provider import FailureKind, TranslationError
+        from app.services.translation_orchestrator import TranslationOrchestrator
+
+        class _P:
+            provider_id = "p2"
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                raise TranslationError("bad lang", FailureKind.UNSUPPORTED_LANGUAGE, self.provider_id)
+
+        orch = TranslationOrchestrator([_P()])
+        with self.assertRaises(ValueError):
+            await orch.translate("hello", "zz")
+
+    async def test_auth_error_disables_provider_and_raises(self):
+        from app.providers.translation_provider import FailureKind, TranslationError
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+
+        class _P:
+            provider_id = "p_auth"
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                raise TranslationError("auth", FailureKind.AUTH_ERROR, self.provider_id)
+
+        orch = TranslationOrchestrator([_P()])
+        state = orch._states["p_auth"]
+
+        with self.assertRaises(ProviderAPIError):
+            await orch.translate("hi", "en")
+
+        self.assertTrue(state.disabled, "AUTH_ERROR must permanently disable entry")
+
+    async def test_no_failover_on_unsupported_language_with_two_providers(self):
+        """UNSUPPORTED_LANGUAGE on first provider must not try second provider."""
+        from app.providers.translation_provider import FailureKind, TranslationError, TranslationResult
+        from app.services.translation_orchestrator import TranslationOrchestrator
+
+        class _Bad:
+            provider_id = "bad"
+            calls = 0
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                self.__class__.calls += 1
+                raise TranslationError("nope", FailureKind.UNSUPPORTED_LANGUAGE, self.provider_id)
+
+        class _Good:
+            provider_id = "good"
+            calls = 0
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                self.__class__.calls += 1
+                return TranslationResult("ok", self.provider_id)
+
+        orch = TranslationOrchestrator([_Bad(), _Good()])
+        with self.assertRaises(ValueError):
+            await orch.translate("hi", "xyz")
+
+        self.assertEqual(_Bad.calls, 1)
+        self.assertEqual(_Good.calls, 0, "Second provider must not be tried for UNSUPPORTED_LANGUAGE")
+
+
+class TestOrchestratorCooldownAndRecovery(unittest.IsolatedAsyncioTestCase):
+    """Cooldown, half-open recovery, all-in-cooldown, attempt budget."""
+
+    def _timeout_provider(self, pid="p_to"):
+        from app.providers.translation_provider import FailureKind, TranslationError
+        class _P:
+            def __init__(self):
+                self.provider_id = pid
+                self.calls = 0
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                self.calls += 1
+                raise TranslationError("timeout", FailureKind.TIMEOUT, self.provider_id)
+        return _P()
+
+    def _success_provider(self, pid="p_ok"):
+        from app.providers.translation_provider import TranslationResult
+        class _P:
+            def __init__(self):
+                self.provider_id = pid
+                self.calls = 0
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                self.calls += 1
+                return TranslationResult("ok", self.provider_id)
+        return _P()
+
+    async def test_provider_enters_cooldown_after_threshold(self):
+        import time
+        from app.services.translation_orchestrator import (
+            TranslationOrchestrator, _FAILURE_THRESHOLD
+        )
+        from app.core.exceptions import ProviderAPIError
+
+        p = self._timeout_provider("cd_p")
+        orch = TranslationOrchestrator([p])
+        state = orch._states["cd_p"]
+
+        for _ in range(_FAILURE_THRESHOLD):
+            with self.assertRaises(ProviderAPIError):
+                await orch.translate("hi", "fr")
+
+        self.assertGreater(state.cooldown_until, time.monotonic(),
+            "Provider must be in cooldown after threshold failures")
+
+    async def test_cooldown_provider_is_skipped(self):
+        import time
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+
+        p = self._timeout_provider("skip_p")
+        orch = TranslationOrchestrator([p])
+        state = orch._states["skip_p"]
+        # Manually put in cooldown
+        state.cooldown_until = time.monotonic() + 3600.0
+
+        with self.assertRaises(ProviderAPIError):
+            await orch.translate("hi", "fr")
+
+        self.assertEqual(p.calls, 0, "Cooldown provider must be skipped entirely")
+
+    async def test_all_providers_in_cooldown_raises_unavailable(self):
+        import time
+        from app.services.translation_orchestrator import TranslationOrchestrator
+        from app.core.exceptions import ProviderAPIError
+
+        p1 = self._timeout_provider("cp1")
+        p2 = self._timeout_provider("cp2")
+        orch = TranslationOrchestrator([p1, p2])
+        for pid in ("cp1", "cp2"):
+            orch._states[pid].cooldown_until = time.monotonic() + 3600.0
+
+        with self.assertRaises(ProviderAPIError) as ctx:
+            await orch.translate("hi", "fr")
+        self.assertIn("unavailable", str(ctx.exception).lower())
+
+    async def test_half_open_recovery_after_cooldown_expires(self):
+        """After cooldown expires, provider becomes eligible and success resets state."""
+        import time
+        from app.services.translation_orchestrator import TranslationOrchestrator
+
+        p = self._success_provider("ho_p")
+        orch = TranslationOrchestrator([p])
+        state = orch._states["ho_p"]
+        # Simulate expired cooldown
+        state.cooldown_until = time.monotonic() - 1.0
+        state.consecutive_failures = 2
+
+        result = await orch.translate("hi", "fr")
+        self.assertEqual(result, "ok")
+        self.assertEqual(state.consecutive_failures, 0,
+            "record_success must reset consecutive_failures")
+        self.assertEqual(state.cooldown_until, 0.0,
+            "record_success must clear cooldown_until")
+
+    async def test_attempt_budget_limits_retries(self):
+        """_MAX_ATTEMPTS caps total provider attempts even with large pool."""
+        from app.providers.translation_provider import FailureKind, TranslationError
+        from app.services.translation_orchestrator import (
+            TranslationOrchestrator, _MAX_ATTEMPTS
+        )
+        from app.core.exceptions import ProviderAPIError
+
+        call_count = 0
+
+        class _P:
+            def __init__(self, pid):
+                self.provider_id = pid
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                nonlocal call_count
+                call_count += 1
+                raise TranslationError("err", FailureKind.SERVER_ERROR, self.provider_id)
+
+        # 20 providers — only _MAX_ATTEMPTS should actually be called
+        providers = [_P(f"pp{i}") for i in range(20)]
+        orch = TranslationOrchestrator(providers)
+
+        with self.assertRaises(ProviderAPIError):
+            await orch.translate("hi", "fr")
+
+        self.assertLessEqual(call_count, _MAX_ATTEMPTS,
+            f"Must not exceed _MAX_ATTEMPTS={_MAX_ATTEMPTS} calls (got {call_count})")
+
+
+class TestOrchestratorDuplicateProviderID(unittest.IsolatedAsyncioTestCase):
+    """Duplicate provider_id: second entry overwrites _EntryState silently."""
+
+    async def test_duplicate_id_state_uses_second_entry(self):
+        """Document the known behaviour: duplicate IDs share one _EntryState."""
+        from app.providers.translation_provider import TranslationResult
+        from app.services.translation_orchestrator import TranslationOrchestrator
+
+        class _P:
+            def __init__(self, pid, val):
+                self.provider_id = pid
+                self._val = val
+            def supported_languages(self): return frozenset()
+            async def translate(self, text, target_lang, source_lang="auto"):
+                return TranslationResult(self._val, self.provider_id)
+
+        p1 = _P("dup", "first")
+        p2 = _P("dup", "second")
+        orch = TranslationOrchestrator([p1, p2])
+        # _states has only one entry for "dup"
+        self.assertEqual(len(orch._states), 1)
+        # First provider returns "first" successfully
+        result = await orch.translate("hi", "fr")
+        self.assertEqual(result, "first")
+
+
+class TestSSRFHardeningLibreTranslate(unittest.TestCase):
+    """
+    Regression tests for every confirmed SSRF bypass in libretranslate_provider.
+    Each previously-bypassing address must now be rejected.
+    """
+
+    def _make(self, url, allow_private=False):
+        from app.providers.libretranslate_provider import LibreTranslateProvider
+        return LibreTranslateProvider(url, "lt_ssrf_test", allow_private=allow_private)
+
+    def _assert_blocked(self, url):
+        with self.assertRaises(ValueError, msg=f"Should be blocked: {url}"):
+            self._make(url)
+
+    def _assert_allowed(self, url):
+        try:
+            p = self._make(url)
+            self.assertEqual(p.provider_id, "lt_ssrf_test")
+        except ValueError as e:
+            self.fail(f"Should be allowed but was blocked: {url} — {e}")
+
+    # --- Previously bypassing addresses ---
+
+    def test_ipv4_mapped_ipv6_private_blocked(self):
+        """::ffff:192.168.1.1 must be blocked (was bypassing regex)."""
+        self._assert_blocked("http://[::ffff:192.168.1.1]:5000")
+
+    def test_ipv4_mapped_ipv6_loopback_blocked(self):
+        """::ffff:127.0.0.1 must be blocked."""
+        self._assert_blocked("http://[::ffff:127.0.0.1]")
+
+    def test_ipv4_mapped_ipv6_cgnat_blocked(self):
+        """::ffff:100.64.0.1 (CGNAT via IPv4-mapped) must be blocked."""
+        self._assert_blocked("http://[::ffff:100.64.0.1]")
+
+    def test_link_local_ipv4_blocked(self):
+        """169.254.169.254 (cloud metadata service) must be blocked."""
+        self._assert_blocked("http://169.254.169.254")
+
+    def test_link_local_range_blocked(self):
+        """169.254.1.1 must be blocked."""
+        self._assert_blocked("http://169.254.1.1")
+
+    def test_cgnat_blocked(self):
+        """100.64.0.1 (RFC 6598 CGNAT) must be blocked."""
+        self._assert_blocked("http://100.64.0.1:5000")
+
+    def test_cgnat_upper_blocked(self):
+        """100.127.255.255 (top of CGNAT range) must be blocked."""
+        self._assert_blocked("http://100.127.255.255:5000")
+
+    # --- Classic private ranges (must still work) ---
+
+    def test_loopback_127_blocked(self):
+        self._assert_blocked("http://127.0.0.1:5000")
+
+    def test_private_10_blocked(self):
+        self._assert_blocked("http://10.0.0.1:5000")
+
+    def test_private_172_16_blocked(self):
+        self._assert_blocked("http://172.16.0.1:5000")
+
+    def test_private_192_168_blocked(self):
+        self._assert_blocked("http://192.168.1.100:5000")
+
+    def test_localhost_hostname_blocked(self):
+        self._assert_blocked("http://localhost:5000")
+
+    def test_metadata_hostname_blocked(self):
+        self._assert_blocked("http://metadata/computeMetadata/v1/")
+
+    def test_ipv6_loopback_blocked(self):
+        self._assert_blocked("http://[::1]:5000")
+
+    # --- Legitimate public endpoints must still be accepted ---
+
+    def test_https_public_domain_allowed(self):
+        self._assert_allowed("https://translate.example.com")
+
+    def test_http_public_domain_allowed(self):
+        self._assert_allowed("http://lt.example.org:5000")
+
+    def test_https_with_path_allowed(self):
+        self._assert_allowed("https://lt.example.com/v2")
+
+    def test_public_ipv6_allowed(self):
+        """A globally routable IPv6 address must be accepted."""
+        # 2606:4700:4700::1111 is Cloudflare's public DNS resolver — unambiguously public
+        self._assert_allowed("http://[2606:4700:4700::1111]:5000")
+
+    # --- allow_private=True bypass ---
+
+    def test_allow_private_permits_loopback(self):
+        """With allow_private=True, private endpoints must be accepted."""
+        p = self._make("http://127.0.0.1:5000", allow_private=True)
+        self.assertEqual(p.provider_id, "lt_ssrf_test")
+
+    def test_allow_private_permits_192_168(self):
+        p = self._make("http://192.168.1.10:5000", allow_private=True)
+        self.assertEqual(p.provider_id, "lt_ssrf_test")
+
+    # --- Schema validation ---
+
+    def test_missing_scheme_blocked(self):
+        with self.assertRaises(ValueError):
+            self._make("translate.example.com")
+
+    def test_ftp_scheme_blocked(self):
+        with self.assertRaises(ValueError):
+            self._make("ftp://translate.example.com")
+
+
+class TestSSRFEndpointSafetyFunction(unittest.TestCase):
+    """Unit tests for the _is_endpoint_safe() helper function."""
+
+    def _safe(self, url):
+        from app.providers.libretranslate_provider import _is_endpoint_safe
+        return _is_endpoint_safe(url)
+
+    def test_public_https_safe(self):
+        self.assertTrue(self._safe("https://translate.example.com"))
+
+    def test_public_ipv4_safe(self):
+        # 1.1.1.1 is Cloudflare's public DNS — unambiguously public
+        self.assertTrue(self._safe("http://1.1.1.1:5000"))
+
+    def test_loopback_unsafe(self):
+        self.assertFalse(self._safe("http://127.0.0.1"))
+
+    def test_private_10_unsafe(self):
+        self.assertFalse(self._safe("http://10.1.2.3"))
+
+    def test_link_local_unsafe(self):
+        self.assertFalse(self._safe("http://169.254.169.254"))
+
+    def test_ipv4_mapped_private_unsafe(self):
+        self.assertFalse(self._safe("http://[::ffff:192.168.1.1]"))
+
+    def test_ipv4_mapped_loopback_unsafe(self):
+        self.assertFalse(self._safe("http://[::ffff:127.0.0.1]"))
+
+    def test_ipv6_loopback_unsafe(self):
+        self.assertFalse(self._safe("http://[::1]"))
+
+    def test_cgnat_unsafe(self):
+        self.assertFalse(self._safe("http://100.64.1.1"))
+
+    def test_cgnat_boundary_lower_unsafe(self):
+        self.assertFalse(self._safe("http://100.64.0.0"))
+
+    def test_cgnat_boundary_upper_unsafe(self):
+        self.assertFalse(self._safe("http://100.127.255.255"))
+
+
+class TestProviderPoolGapDetection(unittest.TestCase):
+    """Configuration gap and duplicate ID detection in pool builders."""
+
+    def test_libretranslate_gap_warning_logged(self):
+        import os
+        import logging
+        from app.providers.libretranslate_provider import build_libretranslate_providers_from_env
+
+        saved = {k: v for k, v in os.environ.items() if "LIBRETRANSLATE" in k}
+        for k in list(saved): del os.environ[k]
+
+        # Set URL and URL_3 but not URL_1, URL_2 — gap should trigger warning
+        os.environ["LIBRETRANSLATE_URL"] = "https://lt0.example.com"
+        os.environ["LIBRETRANSLATE_URL_3"] = "https://lt3.example.com"
+
+        with self.assertLogs("app.providers.libretranslate_provider", level="WARNING") as cm:
+            providers = build_libretranslate_providers_from_env()
+
+        for k in ["LIBRETRANSLATE_URL", "LIBRETRANSLATE_URL_3"]:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+
+        self.assertEqual(len(providers), 2)
+        self.assertTrue(any("gap" in msg.lower() for msg in cm.output),
+            f"Expected gap warning, got: {cm.output}")
+
+    def test_google_gap_warning_logged(self):
+        import os
+        from app.providers.google_cloud_provider import build_google_providers_from_env
+
+        saved = {k: v for k, v in os.environ.items() if "GOOGLE_TRANSLATE" in k}
+        for k in list(saved): del os.environ[k]
+
+        os.environ["GOOGLE_TRANSLATE_API_KEY"] = "key0"
+        os.environ["GOOGLE_TRANSLATE_API_KEY_2"] = "key2"
+        # KEY_1 missing — gap
+
+        with self.assertLogs("app.providers.google_cloud_provider", level="WARNING") as cm:
+            providers = build_google_providers_from_env()
+
+        for k in ["GOOGLE_TRANSLATE_API_KEY", "GOOGLE_TRANSLATE_API_KEY_2"]:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+
+        self.assertEqual(len(providers), 2)
+        self.assertTrue(any("gap" in msg.lower() for msg in cm.output),
+            f"Expected gap warning, got: {cm.output}")
+
+    def test_libretranslate_contiguous_no_gap_warning(self):
+        """No gap warning when entries are contiguous."""
+        import os
+        from app.providers.libretranslate_provider import build_libretranslate_providers_from_env
+
+        saved = {k: v for k, v in os.environ.items() if "LIBRETRANSLATE" in k}
+        for k in list(saved): del os.environ[k]
+
+        os.environ["LIBRETRANSLATE_URL"] = "https://lt0.example.com"
+        os.environ["LIBRETRANSLATE_URL_1"] = "https://lt1.example.com"
+
+        import logging
+        with self.assertLogs("app.providers.libretranslate_provider", logging.DEBUG) as cm:
+            # Inject a dummy log to ensure assertLogs doesn't fail on empty
+            logging.getLogger("app.providers.libretranslate_provider").debug("probe")
+            providers = build_libretranslate_providers_from_env()
+
+        for k in ["LIBRETRANSLATE_URL", "LIBRETRANSLATE_URL_1"]:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+
+        self.assertEqual(len(providers), 2)
+        gap_warnings = [m for m in cm.output if "gap" in m.lower()]
+        self.assertEqual(gap_warnings, [], f"No gap warning expected: {gap_warnings}")
+
+
+class TestIsEndpointSafePublicIPv6(unittest.TestCase):
+    """Ensure public IPv6 addresses are accepted (not treated as private)."""
+
+    def test_public_ipv6_cloudflare_allowed(self):
+        """2606:4700:4700::1111 (Cloudflare DNS) is unambiguously public IPv6."""
+        from app.providers.libretranslate_provider import _is_endpoint_safe
+        self.assertTrue(_is_endpoint_safe("http://[2606:4700:4700::1111]"))
+
+    def test_ipv6_link_local_blocked(self):
+        from app.providers.libretranslate_provider import _is_endpoint_safe
+        self.assertFalse(_is_endpoint_safe("http://[fe80::1]"))
+
+    def test_ipv6_unique_local_blocked(self):
+        from app.providers.libretranslate_provider import _is_endpoint_safe
+        # fc00::/7 is private
+        self.assertFalse(_is_endpoint_safe("http://[fc00::1]"))

@@ -718,7 +718,7 @@ class TestArchitectureInvariants(unittest.TestCase):
     def test_requirements_dependency_count(self):
         req = (PROJECT_ROOT / "requirements.txt").read_text().strip().splitlines()
         non_empty = [r for r in req if r.strip() and not r.startswith("#")]
-        self.assertEqual(len(non_empty), 13, f"Expected 13 deps, got {len(non_empty)}: {non_empty}")
+        self.assertEqual(len(non_empty), 12, f"Expected 12 deps, got {len(non_empty)}: {non_empty}")
 
 
 if __name__ == "__main__":

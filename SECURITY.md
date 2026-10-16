@@ -149,11 +149,41 @@ if user_id in ACTIVE_CLIENTS:
 | Hex encoded IP | `http://0x7f000001/` |
 | Known internal names | `metadata`, `internal`, `169.254.169.254` |
 
-Applied to: `/ip` command input.
+Applied to: `/ip` command input, and LibreTranslate endpoint validation (see below).
 
-**Applies to:** `/ip` only. The `/weather`, `/short`, `/tr`, `/ocr` commands use hardcoded URLs or service-controlled parameters and do not process user-supplied URLs as fetch targets.
+**Applies to:** `/ip` and LibreTranslate provider endpoint validation. The `/weather`, `/short`, `/tr`, `/ocr` commands use hardcoded URLs or service-controlled parameters and do not process user-supplied URLs as fetch targets.
 
 **15 SSRF guard tests pass** (verified in test_behavioral.py `TestSSRFGuard`).
+
+### 9.1 LibreTranslate Endpoint Validation (CHG-022)
+
+LibreTranslate endpoints are **server-side configuration only** (env vars). Telegram users cannot supply URLs. However, a misconfigured or attacker-modified env var could turn the bot into an SSRF relay. CHG-022 replaced the prior regex guard with a layered stdlib approach:
+
+**Guard implementation** (`app/providers/libretranslate_provider.py`):
+
+```
+_is_endpoint_safe(url):
+  1. urlparse(url).hostname  → strips IPv6 brackets, lowercases
+  2. ipaddress.ip_address()  → detects IPv4-mapped IPv6 (::ffff:x.x.x.x)
+                               and unwraps to plain IPv4 before checking
+  3. is_safe_host(host)      → delegates all range checks to network.py
+                               (covers CGNAT, RFC 5737, etc. via _BLOCKED_NETWORKS)
+```
+
+**Previously bypassing (now blocked):**
+
+| Bypass vector | Old regex guard | New stdlib guard |
+|---|---|---|
+| `::ffff:192.168.1.1` (IPv4-mapped IPv6) | ❌ passed | ✅ blocked |
+| `::ffff:127.0.0.1` (loopback via IPv6) | ❌ passed | ✅ blocked |
+| `::ffff:100.64.0.1` (CGNAT via IPv6) | ❌ passed | ✅ blocked |
+| `169.254.169.254` (cloud metadata) | ❌ passed | ✅ blocked |
+| `100.64.0.1` (CGNAT RFC 6598) | ❌ passed | ✅ blocked |
+| `[::1]` (IPv6 loopback bracket notation) | varies | ✅ blocked |
+
+**Opt-in escape hatch:** `LIBRETRANSLATE_ALLOW_PRIVATE_ENDPOINTS=1` — for intentional same-network self-hosted deployments only. Bypasses all range checks when set.
+
+**Test coverage:** `TestSSRFHardeningLibreTranslate` (20 tests) + `TestSSRFEndpointSafetyFunction` (11 tests) + `TestIsEndpointSafePublicIPv6` (3 tests) = 34 dedicated SSRF tests.
 
 ---
 
@@ -260,7 +290,7 @@ Properties:
 | OCR request rate | Delegated to OCRSpace free tier (unknown limit) | No bot-level throttle |
 | IP lookup rate | Delegated to ip-api.com (45 req/min per bot IP) | 429 handled gracefully, no retry |
 | URL shortener rate | Delegated to providers | No bot-level throttle |
-| Translation rate | Delegated to unofficial Google API | No bot-level throttle |
+| Translation rate | Delegated to provider pool (Google Cloud / LibreTranslate); orchestrator applies per-entry cooldown after 3 consecutive failures | No bot-level throttle |
 | Photo size | Telegram Bot API limit: 20 MB for bots | Enforced by Telegram, not bot code |
 | Uploaded .session file size | 512 KB hard limit in code | Enforced in handler |
 | QR content size | ~2953 bytes (qrcode library) | Not enforced in code — DataOverflowError gives generic error |

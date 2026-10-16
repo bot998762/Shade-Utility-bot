@@ -103,7 +103,8 @@ PlatformErrorMiddleware → PlatformDIMiddleware → Handler
 | v.gd (fallback) | /short | None (public) | HTTPS |
 | ip-api.com | /ip | None (free tier) | **HTTP** (intentional — free tier limitation) |
 | wttr.in | /weather | None (public) | HTTPS |
-| Google Translate (unofficial) | /tr | None | HTTPS (via deep_translator) |
+| Google Cloud Translation API v2 (official) | /tr | GOOGLE_TRANSLATE_API_KEY | HTTPS |
+| LibreTranslate (self-hosted, optional) | /tr | LIBRETRANSLATE_URL (+ optional API key) | HTTPS |
 
 **Health endpoints (HTTP):**
 
@@ -343,7 +344,6 @@ aiogram==3.4.1
 pydantic-settings==2.1.0
 python-dotenv==1.0.1
 aiohttp==3.9.1
-deep-translator==1.11.4
 qrcode==7.4.2
 pyzbar==0.1.9
 Pillow==10.2.0
@@ -665,6 +665,44 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### CHG-021
+**Date:** 2026-10-12
+**Type:** Architecture Upgrade — Phase 3 Multi-Provider Translation
+**What changed:**
+- Replaced `deep_translator.GoogleTranslator` (unofficial scraping) with official Google Cloud Translation API v2 (REST, API key auth)
+- Added LibreTranslate as secondary provider family (self-hosted instances supported)
+- New abstraction layer: `app/providers/translation_provider.py` — `ITranslationProvider` Protocol, `FailureKind` enum, `TranslationError`, `TranslationResult`
+- New provider: `app/providers/google_cloud_provider.py` — `GoogleCloudTranslationProvider`, `build_google_providers_from_env()` (reads `GOOGLE_TRANSLATE_API_KEY`, `GOOGLE_TRANSLATE_API_KEY_1`, …)
+- New provider: `app/providers/libretranslate_provider.py` — `LibreTranslateProvider` with SSRF guard (blocks private/internal IP ranges unless `LIBRETRANSLATE_ALLOW_PRIVATE_ENDPOINTS=1`), `build_libretranslate_providers_from_env()` (reads `LIBRETRANSLATE_URL`, `LIBRETRANSLATE_URL_1`, …)
+- New service: `app/services/translation_orchestrator.py` — `TranslationOrchestrator` with per-entry cooldown/circuit-breaker (threshold=3, cooldown=60s), hard attempt cap (8), failover policy (TEMPORARY errors failover; INPUT/AUTH do not)
+- Rewritten: `app/services/translator_service.py` — no longer imports `deep_translator`; delegates to `TranslationOrchestrator`; Phase 2L input validation and `LANG_ALIASES` fully preserved; 5 new aliases added (zh/pt/it/ko/tr kept; zh/chinese, pt/portuguese, it/italian, ko/korean, tr/turkish)
+- Modified: `app/core/bootstrap.py` — added 3 imports, replaced single `TranslatorService()` call with provider-pool construction (Google + LibreTranslate + orchestrator + service)
+- Removed: `deep-translator==1.11.4` from `requirements.txt` (confirmed unused outside `TestTranslatorTimeout`/`TestTranslatorExceptionHardening` which have skip guards)
+- Added 33 new tests across 4 classes: `TestTranslationOrchestrator`, `TestTranslatorServiceWithOrchestrator`, `TestGoogleCloudProviderParsing`, `TestLibreTranslateProviderParsing`
+- All 6 frozen file SHA-256 hashes verified unchanged
+**Files changed:** `app/providers/translation_provider.py` (new), `app/providers/google_cloud_provider.py` (new), `app/providers/libretranslate_provider.py` (new), `app/services/translation_orchestrator.py` (new), `app/services/translator_service.py` (rewritten), `app/core/bootstrap.py` (modified), `requirements.txt` (removed deep-translator), `tests/test_behavioral.py` (appended 33 tests), `PROJECT_CONTEXT.md`, `ARCHITECTURE.md`, `SECURITY.md`
+**New env vars:** `GOOGLE_TRANSLATE_API_KEY` (+ `_1`, `_2`, …), `LIBRETRANSLATE_URL` (+ `_1`, …), `LIBRETRANSLATE_API_KEY` (+ `_1`, …), `LIBRETRANSLATE_ALLOW_PRIVATE_ENDPOINTS`
+**Status:** COMPLETE
+
+---
+
+### CHG-022
+**ID:** CHG-022
+**Date:** 2026-10-15
+**Author:** CHG-022 session
+**Type:** Defect Fix + Security Hardening — Translation Orchestrator & SSRF Guard
+**What changed:**
+- **DEFECT-01 fix** (`app/services/translation_orchestrator.py`): moved `_NO_FAILOVER` check before `record_failure()` so that `UNSUPPORTED_LANGUAGE` and `INVALID_INPUT` errors never increment provider failure counters or trigger cooldown; AUTH/CONFIG errors still call `record_failure()` first (required to set `disabled=True`) then raise without failover
+- **SSRF hardening** (`app/providers/libretranslate_provider.py`): replaced regex-based IP blocking with stdlib `ipaddress` + `urlparse` + `is_safe_host()` delegation; now correctly blocks IPv4-mapped IPv6 (`::ffff:192.168.x.x`), CGNAT (100.64.0.0/10, RFC 6598), link-local (169.254.0.0/16, fe80::/10), loopback, and all ranges in `network.py`'s `_BLOCKED_NETWORKS`; added `_is_endpoint_safe()`, `_get_allow_private()`, `allow_private` kwarg on `LibreTranslateProvider.__init__`
+- **Lazy imports**: moved `import aiohttp` inside `translate()` method bodies in both `libretranslate_provider.py` and `google_cloud_provider.py` so validation helpers remain importable without aiohttp installed
+- **Configuration gap/duplicate detection** (`build_libretranslate_providers_from_env()`, `build_google_providers_from_env()`): both pool builders now scan indices 1–30 detecting gaps in numbered env var sequences (logged as WARNING) and reject duplicate `provider_id` entries (logged as ERROR)
+- **50 new tests** across 8 new test classes in `tests/test_behavioral.py`: `TestOrchestratorDefect01Regression`, `TestOrchestratorCooldownAndRecovery`, `TestOrchestratorDuplicateProviderID`, `TestSSRFHardeningLibreTranslate`, `TestSSRFEndpointSafetyFunction`, `TestProviderPoolGapDetection`, `TestIsEndpointSafePublicIPv6`
+- All 6 frozen file SHA-256 hashes verified unchanged before and after
+**Files changed:** `app/services/translation_orchestrator.py` (DEFECT-01 fix), `app/providers/libretranslate_provider.py` (SSRF hardening, lazy import, gap detection), `app/providers/google_cloud_provider.py` (lazy import, gap detection), `tests/test_behavioral.py` (appended 50 tests, 226→276 total), `PROJECT_CONTEXT.md`, `SECURITY.md`, `ARCHITECTURE.md`, `TESTING.md`
+**Status:** COMPLETE
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -736,6 +774,15 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 - Frozen /string MD5: `c61dcc219b29736e228bdc1d0915d82d` ✅ unchanged
 - Commands: 27, Callbacks: 22, HTTP routes: 3, Dependencies: 13
+- Result: **SAFE TO CONTINUE**
+
+### CHG-022 — Translation Orchestrator Fixes & SSRF Hardening
+- DEFECT-01 fix verified: `consecutive_failures` stays 0 after UNSUPPORTED_LANGUAGE/INVALID_INPUT calls
+- SSRF bypass vectors confirmed closed: IPv4-mapped IPv6, CGNAT, link-local, loopback all blocked
+- Gap/duplicate detection verified by dedicated test class
+- Frozen SHA-256 hashes: all 6 unchanged before and after edits
+- Secret-leak AST check: CLEAN (no API keys/tokens in source, tests, or docs)
+- Test results: **178 passed, 98 skipped, 0 errors, 0 failures** (276 total collected)
 - Result: **SAFE TO CONTINUE**
 
 ---
@@ -920,7 +967,7 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 | P2 | Wire `metrics.api_failures` counter | Low | None | None | Phase 2F |
 | P3 | Tesseract local OCR fallback | Medium | Low | tesseract-ocr system + pytesseract | Phase 3 |
 | P3 | HaveIBeenPwned integration (opt-in, k-anon) | Medium | Medium (external API, SHA-1 prefix) | None | Phase 3 |
-| P3 | `/tr` official API (DeepL/LibreTranslate) | Medium | Low (new API key) | deepl or libretranslate | Phase 3 |
+| P3 | `/tr` official API (DeepL/LibreTranslate) | Medium | Low (new API key) | deepl or libretranslate | ~~Phase 3~~ **DONE (Phase 3 / CHG-021)** |
 | P3 | `/ip` ASN + reverse DNS | Medium | None | dnspython | Phase 3 |
 | P3 | CapabilityRegistry admin toggle via /diag | Medium | Medium (runtime feature disable) | None | Phase 4 |
 | P3 | Event bus subscribers (audit/metrics) | Medium | None | None | Phase 4 |

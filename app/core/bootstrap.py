@@ -43,6 +43,9 @@ from app.providers.url_providers import CleanURIProvider, VGdURLProvider
 from app.services.ocr_service import OCRService
 from app.services.shortener_service import ShortenerService
 from app.services.translator_service import TranslatorService
+from app.services.translation_orchestrator import TranslationOrchestrator
+from app.providers.google_cloud_provider import build_google_providers_from_env
+from app.providers.libretranslate_provider import build_libretranslate_providers_from_env
 
 from app.middlewares.di import PlatformDIMiddleware
 from app.middlewares.error import PlatformErrorMiddleware
@@ -108,7 +111,16 @@ class ApplicationBootstrap:
 
             self.ocr_service = OCRService(ocr_engine, self.event_bus)
             self.shortener_service = ShortenerService(url_engine)
-            self.translator_service = TranslatorService()
+            _google_providers = build_google_providers_from_env()
+            _lt_providers = build_libretranslate_providers_from_env()
+            _all_providers = _google_providers + _lt_providers
+            if not _all_providers:
+                logger.warning(
+                    "No translation providers configured. "
+                    "Set GOOGLE_TRANSLATE_API_KEY or LIBRETRANSLATE_URL to enable /tr."
+                )
+            _translation_orchestrator = TranslationOrchestrator(_all_providers)
+            self.translator_service = TranslatorService(orchestrator=_translation_orchestrator)
 
             # --- Middleware ---
             self.dp.message.middleware(PlatformErrorMiddleware())
