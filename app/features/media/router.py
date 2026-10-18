@@ -212,36 +212,16 @@ async def cmd_translate(
     message: Message,
     translator_service: TranslatorService,
 ) -> None:
-    args = message.text.split()
-    target_lang = args[1].lower() if len(args) > 1 else "en"
-    text = ""
-    if message.reply_to_message and message.reply_to_message.text:
-        text = message.reply_to_message.text
-    elif len(args) > 2:
-        text = message.text.split(maxsplit=2)[2]
-
-    if not text:
-        await message.reply(
-            "❌ Reply to text or format: <code>/tr &lt;lang&gt; &lt;text&gt;</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    try:
-        translated = await translator_service.translate(text, target_lang)
-        # Translation output can contain any character in the target language
-        e_translated = _html.escape(translated)
-        e_lang = _html.escape(target_lang.upper())
-        await message.reply(
-            f"🌍 <b>Translation ({e_lang}):</b>\n{e_translated}",
-            parse_mode="HTML",
-        )
-    except TimeoutError as te:
-        await message.reply(f"⏱️ {_html.escape(str(te))}", parse_mode="HTML")
-    except ValueError as ve:
-        await message.reply(f"❌ {_html.escape(str(ve))}", parse_mode="HTML")
-    except ProviderAPIError as e:
-        await message.reply(f"⚠️ {_html.escape(str(e))}", parse_mode="HTML")
+    # Translation is under development. The full implementation (providers,
+    # orchestrator, services) is preserved and will be wired up in a future
+    # release. For now, every /tr invocation returns the upcoming-feature notice.
+    await message.reply(
+        "🌐 <b>Translation — Coming Soon!</b>\n\n"
+        "Translation is currently under development and will be available "
+        "in a future update.\n\n"
+        "Stay tuned for upcoming updates!",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("qr"))

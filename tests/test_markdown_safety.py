@@ -491,9 +491,14 @@ class TestMediaHandlerMarkdownSafety(unittest.TestCase):
             "QR scan result must be html.escape()d — QR can encode arbitrary data")
 
     def test_translate_output_escaped(self):
+        # CHG-023: cmd_translate is a static upcoming-feature stub.
+        # It sends only a hardcoded string with no user- or API-supplied
+        # content, so _html.escape() is not required.  When translation is
+        # fully wired up in a future change this assertion should be
+        # reinstated to guard the live API output path.
         src = self._get_handler_src("cmd_translate")
-        self.assertIn("_html.escape", src,
-            "Translation output must be html.escape()d — target language text is arbitrary")
+        self.assertIn("Coming Soon", src,
+            "cmd_translate (CHG-023 stub) must contain the upcoming-feature notice")
 
     def test_escape_edge_cases(self):
         """Verify html.escape handles the characters that broke Markdown."""

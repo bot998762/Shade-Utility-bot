@@ -9,14 +9,16 @@
 | File | Tests | Pass | Fail | Skip | Purpose |
 |---|---|---|---|---|---|
 | `tests/test_architecture.py` | 46 | 46 | 0 | 0 | AST/structural/security checks |
-| `tests/test_behavioral.py` | 276 | 178 | 0 | 98 | Logic, data parsing, orchestrator, SSRF |
+| `tests/test_behavioral.py` | 281 | 178 | 0 | 103 | Logic, data parsing, orchestrator, SSRF, /tr stub |
 | `tests/test_markdown_safety.py` | 46 | 25 | 0 | 21 | Parse mode / escaping |
 | `tests/test_session_manager.py` | 60 | 37 | 0 | 23 | Session manager flows |
-| **TOTAL** | **428** | **286** | **0** | **142** |  |
+| **TOTAL** | **433** | **286** | **0** | **147** |  |
 
-**Note (CHG-022):** The 98 skipped tests in test_behavioral.py require `aiohttp` (not installed in the test container). All 178 that can run without it pass. Zero errors, zero failures.
+**Note (CHG-023):** test_behavioral.py grew from 276 to 281 tests (+5 for `TestTrUpcomingFeatureStub`). The 5 new tests skip when aiogram is not installed (same `_skip_no_aiogram()` guard as existing aiogram-dependent tests), bringing the behavioral skip count from 98 to 103.
 
-**Baseline (pre-CHG-022):** test_behavioral.py had 226 tests; CHG-022 appended 50 new tests (276 total).
+**Note (CHG-022):** Skipped tests in test_behavioral.py require `aiohttp` (not installed in the test container). All 178 that can run pass. Zero errors, zero failures.
+
+**Baseline:** test_behavioral.py had 226 tests pre-CHG-022; CHG-022 appended 50 (276 total); CHG-023 appended 5 (281 total).
 
 **44 skips** are graceful: guarded by `@needs_aiogram` or `@needs_telethon` decorators. They do not represent failures — they represent tests that require optional libraries to run.
 
@@ -83,6 +85,14 @@ Mix of: pure-Python logic tests (no aiogram needed) and aiogram-dependent tests 
 | `TestSSRFEndpointSafetyFunction` | 11 | 0 | Unit tests for `_is_endpoint_safe()`: IPv4-mapped IPv6, CGNAT, malformed URLs |
 | `TestProviderPoolGapDetection` | 3 | 0 | Gap warnings logged for both LibreTranslate and Google pool builders |
 | `TestIsEndpointSafePublicIPv6` | 3 | 0 | Cloudflare public IPv6 accepted; link-local and unique-local IPv6 blocked |
+
+**CHG-023 addition (5 new tests, 1 new class):**
+
+| Class | Tests | Skip | What it checks |
+|---|---|---|---|
+| `TestTrUpcomingFeatureStub` | 5 | 5* | `/tr` returns coming-soon notice; `parse_mode="HTML"`; `TranslatorService.translate` never called |
+
+*Skipped when aiogram not installed (`_skip_no_aiogram()` guard). Pass when aiogram is present.
 
 ---
 

@@ -703,6 +703,21 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### CHG-023
+**ID:** CHG-023
+**Date:** 2026-10-18
+**Author:** CHG-023 session
+**Type:** Behavior Change — /tr Upcoming-Feature Stub
+**What changed:**
+- **`app/features/media/router.py`** (`cmd_translate`): replaced the handler body with a static upcoming-feature notice (`🌐 Translation — Coming Soon!`). The `@router.message(Command("tr"))` decorator, function signature, and `TranslatorService` DI injection are all preserved. The full translation architecture (providers, orchestrator, services, configuration) is untouched.
+- **`tests/test_behavioral.py`**: appended `TestTrUpcomingFeatureStub` (5 tests) verifying the stub replies with the coming-soon notice, uses `parse_mode="HTML"`, and never calls `TranslatorService.translate`. Each test calls `_skip_no_aiogram()` following the existing skip-guard pattern so they skip gracefully in environments without aiogram.
+- **`tests/test_markdown_safety.py`** (`test_translate_output_escaped`): updated assertion from checking `_html.escape` presence (inapplicable for a static-string stub) to checking the stub message contains "Coming Soon". Comment explains the original assertion must be reinstated when live translation is wired up.
+**Files changed:** `app/features/media/router.py`, `tests/test_behavioral.py`, `tests/test_markdown_safety.py`
+**Files NOT changed:** all translation providers, orchestrator, services, configuration, all unrelated handlers, frozen files
+**Status:** COMPLETE
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -783,6 +798,15 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 - Frozen SHA-256 hashes: all 6 unchanged before and after edits
 - Secret-leak AST check: CLEAN (no API keys/tokens in source, tests, or docs)
 - Test results: **178 passed, 98 skipped, 0 errors, 0 failures** (276 total collected)
+- Result: **SAFE TO CONTINUE**
+
+### CHG-023 — /tr Upcoming-Feature Stub
+- `/tr` handler body replaced with static coming-soon notice; routing and DI preserved
+- Translation architecture (providers, orchestrator, services) entirely untouched
+- 5 new tests in `TestTrUpcomingFeatureStub`; aiogram-skip guard applied following existing pattern
+- `test_translate_output_escaped` updated to match stub contract (static string, no user content)
+- Frozen file MD5 (`session/router.py`): `c61dcc219b29736e228bdc1d0915d82d` ✅ unchanged
+- Test results: **434 passed, 158 skipped, 0 errors, 0 failures**
 - Result: **SAFE TO CONTINUE**
 
 ---

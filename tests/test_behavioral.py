@@ -4661,3 +4661,124 @@ class TestIsEndpointSafePublicIPv6(unittest.TestCase):
         from app.providers.libretranslate_provider import _is_endpoint_safe
         # fc00::/7 is private
         self.assertFalse(_is_endpoint_safe("http://[fc00::1]"))
+
+
+# ---------------------------------------------------------------------------
+# CHG-023: /tr upcoming-feature stub
+# ---------------------------------------------------------------------------
+
+class TestTrUpcomingFeatureStub(unittest.IsolatedAsyncioTestCase):
+    """
+    Verify that cmd_translate always returns the upcoming-feature notice
+    regardless of arguments, without calling the underlying TranslatorService.
+
+    The router module imports aiogram at the top level; these tests are
+    skipped when aiogram is not installed (same pattern as TestIdInfoNoneFromUser).
+    When aiogram IS installed the tests call cmd_translate directly, bypassing
+    the dispatcher, so no running bot instance is needed.
+    """
+
+    def _skip_no_aiogram(self):
+        try:
+            import aiogram  # noqa: F401
+        except ImportError:
+            self.skipTest("aiogram not installed")
+
+    async def _invoke(self, text: str) -> str:
+        """Run cmd_translate with a fake message; return the reply text."""
+        self._skip_no_aiogram()
+        from unittest.mock import AsyncMock, MagicMock
+        from app.features.media.router import cmd_translate
+
+        msg = MagicMock()
+        msg.text = text
+        msg.reply_to_message = None
+        reply_calls = []
+
+        async def _capture_reply(content, **kwargs):
+            reply_calls.append(content)
+
+        msg.reply = _capture_reply
+
+        # TranslatorService is injected by DI; pass a sentinel that would
+        # raise if any of its methods were called.
+        sentinel_svc = MagicMock(name="TranslatorService_sentinel")
+        sentinel_svc.translate = AsyncMock(side_effect=AssertionError(
+            "TranslatorService.translate must NOT be called while /tr is stubbed"
+        ))
+
+        await cmd_translate(msg, translator_service=sentinel_svc)
+        self.assertEqual(len(reply_calls), 1, "Expected exactly one reply")
+        return reply_calls[0]
+
+    async def test_tr_no_args_returns_coming_soon(self):
+        reply = await self._invoke("/tr")
+        self.assertIn("Coming Soon", reply)
+
+    async def test_tr_with_lang_returns_coming_soon(self):
+        reply = await self._invoke("/tr fr Hello")
+        self.assertIn("Coming Soon", reply)
+
+    async def test_tr_with_reply_returns_coming_soon(self):
+        """Even if reply_to_message is set the stub should still return the notice."""
+        self._skip_no_aiogram()
+        from unittest.mock import AsyncMock, MagicMock
+        from app.features.media.router import cmd_translate
+
+        msg = MagicMock()
+        msg.text = "/tr es"
+        msg.reply_to_message = MagicMock()
+        msg.reply_to_message.text = "some text to translate"
+        reply_calls = []
+
+        async def _capture_reply(content, **kwargs):
+            reply_calls.append(content)
+
+        msg.reply = _capture_reply
+
+        sentinel_svc = MagicMock(name="TranslatorService_sentinel")
+        sentinel_svc.translate = AsyncMock(side_effect=AssertionError(
+            "TranslatorService.translate must NOT be called while /tr is stubbed"
+        ))
+
+        await cmd_translate(msg, translator_service=sentinel_svc)
+        self.assertEqual(len(reply_calls), 1)
+        self.assertIn("Coming Soon", reply_calls[0])
+
+    async def test_tr_reply_uses_html_parse_mode(self):
+        """The reply must specify parse_mode='HTML'."""
+        self._skip_no_aiogram()
+        from unittest.mock import AsyncMock, MagicMock
+        from app.features.media.router import cmd_translate
+
+        msg = MagicMock()
+        msg.text = "/tr hi"
+        msg.reply_to_message = None
+        captured_kwargs = {}
+
+        async def _capture_reply(content, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        msg.reply = _capture_reply
+        sentinel_svc = MagicMock()
+        sentinel_svc.translate = AsyncMock(side_effect=AssertionError("should not call"))
+
+        await cmd_translate(msg, translator_service=sentinel_svc)
+        self.assertEqual(captured_kwargs.get("parse_mode"), "HTML")
+
+    async def test_translator_service_never_called(self):
+        """TranslatorService.translate is never invoked by the stub."""
+        self._skip_no_aiogram()
+        from unittest.mock import AsyncMock, MagicMock
+        from app.features.media.router import cmd_translate
+
+        msg = MagicMock()
+        msg.text = "/tr de Guten Tag"
+        msg.reply_to_message = None
+        msg.reply = AsyncMock()
+
+        svc = MagicMock()
+        svc.translate = AsyncMock()
+
+        await cmd_translate(msg, translator_service=svc)
+        svc.translate.assert_not_called()
