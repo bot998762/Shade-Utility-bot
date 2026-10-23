@@ -37,6 +37,7 @@ from app.platform.capability import CapabilityRegistry
 from app.platform.event_bus import EventBus
 from app.platform.failover import ProviderFailoverEngine
 from app.core.circuit_breaker import CircuitBreaker
+from app.utils.safe_url import create_guarded_session
 
 from app.providers.ocr_providers import OCRSpaceProvider, DummyFallbackOCRProvider
 from app.providers.url_providers import CleanURIProvider, VGdURLProvider
@@ -66,6 +67,9 @@ class ApplicationBootstrap:
         self.capability_registry = CapabilityRegistry()
         self.event_bus = EventBus()
         self.http_session: aiohttp.ClientSession | None = None
+        # CHG-024: dedicated session for user-supplied URLs (/short expand).
+        # Its connector validates resolved addresses; never reuse http_session for this.
+        self.expand_session: aiohttp.ClientSession | None = None
         self.bot_username = "ShadeUtilityBot"
 
         # Services (set during on_startup)
@@ -84,6 +88,7 @@ class ApplicationBootstrap:
             settings.validate_startup()
 
             self.http_session = aiohttp.ClientSession()
+            self.expand_session = create_guarded_session()
 
             bot_info = await self.bot.get_me()
             self.bot_username = bot_info.username
@@ -205,6 +210,12 @@ class ApplicationBootstrap:
         await self._close_http_resources()
 
     async def _close_http_resources(self) -> None:
+        if self.expand_session and not self.expand_session.closed:
+            try:
+                await self.expand_session.close()
+            except Exception as exc:
+                logger.warning({"event": "expand_session_close_error", "error": str(exc)})
+
         if self.http_session and not self.http_session.closed:
             try:
                 await self.http_session.close()

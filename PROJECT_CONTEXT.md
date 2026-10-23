@@ -718,6 +718,41 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### CHG-024
+**ID:** CHG-024
+**Date:** 2026-10-19
+**Author:** CHG-024 session
+**Type:** Security Fix — `/short expand` SSRF hardening
+**Root cause (confirmed from source, not exploited live):** `is_safe_host()` returns `True` for any non-IP hostname, and `_cmd_short_expand` validated only hostname text before aiohttp resolved and connected. `127.0.0.1.nip.io` and `localtest.me` passed the guard (reproduced as a pure function call). Also found: `logger` was referenced but never defined in `media/router.py` (NameError on the helper's error path), and the helper created its own `ClientSession` per request.
+**What changed:**
+- **New `app/utils/safe_url.py`** (stdlib at import; aiohttp lazy): `validate_public_http_url` (scheme, credentials, port, host normalisation, non-canonical numeric hosts, IP literals), `is_prohibited_ip` (IPv4, IPv6, IPv4-mapped, 6to4/Teredo/NAT64-embedded), `GuardedResolver` (validates every DNS answer at connection time, fails closed on any prohibited/malformed/empty answer or timeout), `create_guarded_session`, `trace_redirects` (HEAD, per-hop validation, loop detection, 5-hop limit, 20 s deadline), `classify_network_error`.
+- **`app/core/bootstrap.py`:** new `expand_session` created at startup after `http_session` and closed first inside `_close_http_resources()` (shutdown order unchanged; `_close_http_resources()` still last).
+- **`app/features/media/router.py`:** `_cmd_short_expand` rewritten as a thin handler over `safe_url`; `cmd_short` now receives `bootstrap_ref` (existing DI); `logger` defined; generic user-facing errors (no hosts/IPs/exception text); fails closed if the guarded session is missing. `/tr` Coming Soon handler and all other handlers untouched.
+- **Design (steelman):** hostname-string validation (rejected: cannot know resolution), resolve-then-connect (rejected: check-then-connect/rebinding gap), connect-to-validated-IP (rejected: complicates TLS/SNI), **validating resolver inside the connector (chosen)**: the validated address list is the one connected to, TLS hostname verification/SNI unchanged, DNS cache disabled so every connection is re-validated. Dedicated session (not the shared `http_session`) because the shared one also serves ip-api, wttr.in, OCR.space, shorteners and may reach private LibreTranslate endpoints by opt-in. No new dependencies.
+- **Tests:** new `tests/test_short_expand_ssrf.py` (67 collected: 60 pass, 7 skipped needing aiohttp); 8 legacy source-string assertions in `TestPhase2J_ShortExpand` updated to the new module (equivalent or stronger properties).
+- **Docs:** SECURITY.md (new section 9.2, corrected section 9 scope), ARCHITECTURE.md, COMMAND_REFERENCE.md, TESTING.md (counts corrected, see below), this file.
+**Behaviour changes users can see:** generic error text instead of echoed hosts/exception class names; redirect-limit notice; redirect-loop message; credentials/port rejection messages; overall 20 s deadline (previously up to 15 s per hop); protocol-relative redirects (`//host/path`) now resolve correctly.
+**Files changed:** `app/utils/safe_url.py` (new), `app/core/bootstrap.py`, `app/features/media/router.py`, `tests/test_short_expand_ssrf.py` (new), `tests/test_phase2c_2k.py`, `SECURITY.md`, `ARCHITECTURE.md`, `COMMAND_REFERENCE.md`, `TESTING.md`, `PROJECT_CONTEXT.md`
+**Files NOT changed:** `app/features/session/router.py` (frozen), `app/utils/network.py` (FROZEN-04 `is_safe_host` untouched), `app/middlewares/*`, translation providers/orchestrator/services, OCR/QR/Dev Suite/session/admin features, `requirements.txt`
+**Known limitations:** aiohttp-level enforcement (7 tests) could not be executed in the development environment because aiohttp could not be installed; resolver logic is verified with fakes and aiohttp behaviour relied on is documented aiohttp 3.9.x semantics. No live penetration test was performed. Mixed public/private DNS answers and NAT64 destinations are rejected by design. Non-standard ports on public hosts remain allowed. HEAD-rejecting servers are reported as final. `is_safe_host()` remains string-only for its other callers. No per-user rate limiting.
+**Status:** COMPLETE (pending aiohttp-environment run of the 7 skipped integration tests)
+
+---
+
+### CHG-024 Follow-up — Regression Failure Investigation (QR overflow, health readiness test isolation)
+**Reported:** independent run of the CHG-024 ZIP: 520 passed, 137 skipped, 2 failed (SSRF tests 67/67 passed).
+**Reproduction:** both failures reproduced in the development sandbox using real library sources (qrcode 7.4.2 pinned, aiohttp 3.9.1 pure-Python build, from upstream GitHub tags via PYTHONPATH in a scratch directory; nothing added to the project).
+**Failure 1 — QR oversized input (implementation defect, not a stale test).** `qrcode.make()` uses auto-fit; `QRCode.best_fit()` assigns version 41 to `self.version`, whose setter validates 1–40 and raises `ValueError("Invalid version (was 41, expected 1 to 40)")` before the library's own `DataOverflowError` is reached. Verified identical on qrcode 7.4.2, 8.0 and 8.2 (so not a dependency-version drift). Consequence: the Phase 2B `except QRDataOverflowError` in `cmd_qr` never fired for genuinely oversized input and users got the generic internal-error message. The test's expectation (`DataOverflowError`) was correct.
+**Fix:** `app/utils/qr.py` — `generate_qr_buffer()` catches only `ValueError` from `qrcode.make()` and calls `_raise_if_data_overflow()`, which encodes at fixed version 40 (the library path that does raise `DataOverflowError`); if the data fits, the original `ValueError` is re-raised unchanged. No message matching, no broad `except Exception`. `cmd_qr` and its user-facing message are unchanged.
+**Failure 2 — health readiness 200 vs 503 (test bug, not a contract bug).** `TestHealthReadinessLiveState._reset_health()` in `tests/test_behavioral.py` had `return health` before the block that resets `health._readiness`, so the reset was dead code and module-level state left by earlier tests (`ready=True` from `set_ready`) leaked. Reproduced even within the class alone; a single test alone passed. `app/core/health.py` (503 before startup) is correct and unchanged.
+**Fix:** removed the premature `return` so the reset runs.
+**Regression tests:** `test_architecture.py::TestQRDataOverflowHandling` +3 (oversized never leaks plain ValueError; 2,900-char input still yields PNG; unrelated ValueError propagates unchanged); `test_behavioral.py::TestHealthReadinessLiveState::test_reset_health_discards_state_left_by_earlier_tests` +1. Negative controls: with the old code the new QR test and the existing health test fail.
+**Files changed:** `app/utils/qr.py`, `tests/test_architecture.py`, `tests/test_behavioral.py`, `TESTING.md`, `PROJECT_CONTEXT.md`
+**Files NOT changed:** `app/utils/safe_url.py` and all other CHG-024 SSRF code, `app/core/health.py`, `app/features/media/router.py`, `/tr`, frozen files, `requirements.txt`
+**Status:** RESOLVED
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -809,7 +844,22 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 - Test results: **434 passed, 158 skipped, 0 errors, 0 failures**
 - Result: **SAFE TO CONTINUE**
 
+### CHG-024 — /short expand SSRF Hardening
+- Full suite: **494 passed, 165 skipped, 0 failed** (659 collected; 136 subtests passed). Previous baseline 434 passed / 158 skipped.
+- New focused file `tests/test_short_expand_ssrf.py`: 60 passed, 7 skipped (aiohttp not installed). Also run on Python 3.11 and 3.12.
+- Negative controls: guard removed in scratch copies → 84 and 21 test failures (tests detect a weakened guard).
+- Lint: ruff/flake8/mypy clean on `safe_url.py`; remaining findings in touched files are pre-existing (unused `ProviderAPIError` import, `try/except/pass` in bootstrap).
+- Frozen `app/features/session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d` unchanged; `middlewares/error.py`, `middlewares/di.py` and `utils/network.py` byte-identical to the pre-change snapshot.
+- **Unverified:** real aiohttp connector enforcement (7 skipped tests), live behaviour, dependency installation. TESTING.md totals corrected (earlier table was inaccurate).
+- Result: **SAFE TO CONTINUE** once the 7 aiohttp integration tests are run in a full environment.
+
 ---
+
+### CHG-024 Follow-up Verification
+- Sandbox with real qrcode 7.4.2 + aiohttp 3.9.1 sources (pure-Python, scratch PYTHONPATH): full suite 520 passed, 143 skipped (aiogram/telethon/pyzbar absent), 0 failed; SSRF file 67 passed (0 skipped, including the 7 aiohttp connector tests); both formerly failing tests pass individually and together; qrcode 8.2 also passes the QR tests.
+- Default sandbox (no optional deps): 494 passed, 169 skipped, 0 failed (4 new tests skip without deps).
+- Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d` unchanged; `error.py`, `di.py`, `network.py`, `safe_url.py` byte-identical to the pre-change snapshot.
+- Skips are not counted as passes.
 
 ## 12. KNOWN ISSUES
 

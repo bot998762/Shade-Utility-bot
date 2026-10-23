@@ -6,21 +6,29 @@
 
 ## 1. Test Suite Overview
 
-| File | Tests | Pass | Fail | Skip | Purpose |
+| File | Collected | Pass | Fail | Skip | Purpose |
 |---|---|---|---|---|---|
-| `tests/test_architecture.py` | 46 | 46 | 0 | 0 | AST/structural/security checks |
-| `tests/test_behavioral.py` | 281 | 178 | 0 | 103 | Logic, data parsing, orchestrator, SSRF, /tr stub |
+| `tests/test_architecture.py` | 80 | 66 | 0 | 14 | AST/structural/security checks |
+| `tests/test_behavioral.py` | 282 | 178 | 0 | 104 | Logic, data parsing, orchestrator, SSRF, /tr stub |
 | `tests/test_markdown_safety.py` | 46 | 25 | 0 | 21 | Parse mode / escaping |
+| `tests/test_phase2c_2k.py` | 128 | 128 | 0 | 0 | Phase 2C–2K features and architecture invariants |
 | `tests/test_session_manager.py` | 60 | 37 | 0 | 23 | Session manager flows |
-| **TOTAL** | **433** | **286** | **0** | **147** |  |
+| `tests/test_short_expand_ssrf.py` | 67 | 60 | 0 | 7 | `/short expand` SSRF hardening (CHG-024) |
+| **TOTAL** | **663** | **494** | **0** | **169** | 136 subtests also passed |
 
-**Note (CHG-023):** test_behavioral.py grew from 276 to 281 tests (+5 for `TestTrUpcomingFeatureStub`). The 5 new tests skip when aiogram is not installed (same `_skip_no_aiogram()` guard as existing aiogram-dependent tests), bringing the behavioral skip count from 98 to 103.
+Command: `/root/.local/bin/pytest tests/ -q` → `494 passed, 169 skipped, 136 subtests passed`.
 
-**Note (CHG-022):** Skipped tests in test_behavioral.py require `aiohttp` (not installed in the test container). All 178 that can run pass. Zero errors, zero failures.
+**CHG-024 follow-up:** +4 tests (3 QR overflow regression, 1 health-state isolation) that skip without optional deps. With real qrcode 7.4.2 and aiohttp 3.9.1 available, the full suite is 520 passed, 143 skipped, 0 failed (aiogram, telethon and pyzbar still absent).
 
-**Baseline:** test_behavioral.py had 226 tests pre-CHG-022; CHG-022 appended 50 (276 total); CHG-023 appended 5 (281 total).
+**Correction (CHG-024):** earlier versions of this table listed 433 total / 286 pass / 147 skip. That was wrong: it omitted `test_phase2c_2k.py` (128 tests) and listed `test_architecture.py` as 46 tests when it collects 77. The table above is taken from actual collection and per-file runs. Before CHG-024 the full suite was 434 passed / 158 skipped (592 collected); CHG-024 added 67 collected tests (60 pass, 7 skip).
 
-**44 skips** are graceful: guarded by `@needs_aiogram` or `@needs_telethon` decorators. They do not represent failures — they represent tests that require optional libraries to run.
+**Skipped tests are NOT passes.** Skip reasons in the current environment (`pytest -rs`): telethon not installed 86; aiogram not installed 32; deep_translator not installed 19; aiohttp not installed 21; pydantic_settings not installed 4; qrcode not installed 5; prometheus_client or other dependency not installed 2. Earlier notes attributing the behavioral skips to aiohttp alone were inaccurate.
+
+**Dead tests:** the 19 `deep_translator` skips can never run as written: `deep-translator` was removed from `requirements.txt` in CHG-021 and nothing in `app/` imports it.
+
+**Environment limitation:** aiogram, aiohttp, Telethon, qrcode, pyzbar, pydantic-settings, cachetools, python-json-logger and prometheus_client are not installed in the development container and could not be installed (package index unreachable). Handler-level behaviour and anything needing a real aiohttp connector were therefore not executed there. Run the full suite in an environment built from `requirements.txt` for complete coverage.
+
+Skips are graceful: guarded by `@needs_aiogram`, `@needs_telethon`, `skipTest(...)` or `skipUnless(...)`. They do not represent failures — they are tests that require optional libraries, and they are reported separately from passes.
 
 **Known broken tests (currently masked by skip):** `TestHealthEndpoints` — would fail with TypeError and assertion errors if aiohttp were present (see Section 4).
 
@@ -50,10 +58,10 @@ Pure AST/import/structural tests. No network. No Telegram. No mock of Bot.
 
 ---
 
-### `tests/test_behavioral.py` (276 tests: 178 pass, 98 skip — CHG-022 updated)
+### `tests/test_behavioral.py` (281 tests: 178 pass, 103 skip)
 
 Mix of: pure-Python logic tests (no aiogram needed) and aiogram-dependent tests (skipped).
-98 tests are skipped because `aiohttp` is not installed in the test container.
+103 tests are skipped because optional libraries (aiogram, aiohttp, deep_translator, …) are not installed in the test container.
 
 **Original classes (pre-CHG-022):**
 
@@ -95,6 +103,24 @@ Mix of: pure-Python logic tests (no aiogram needed) and aiogram-dependent tests 
 *Skipped when aiogram not installed (`_skip_no_aiogram()` guard). Pass when aiogram is present.
 
 ---
+
+### `tests/test_short_expand_ssrf.py` (67 tests: 60 pass, 7 skip, 136 subtests — CHG-024)
+
+All DNS and HTTP behaviour is faked (scripted resolver, fake sessions). No real network traffic, no real internal services, no port scanning. Layers 1–5 are stdlib-only and also pass on Python 3.11 and 3.12 (`python3.X -m unittest tests.test_short_expand_ssrf`).
+
+| Class | Tests | What it checks |
+|---|---|---|
+| `TestUrlValidation` | 12 | Valid public URLs; schemes; embedded credentials; invalid ports; malformed input; non-canonical numeric hosts (decimal/octal/hex/short); prohibited IP literals; bracketed IPv6 and IPv4-mapped IPv6; zone ids; internal names; case/trailing-dot/IDNA normalisation |
+| `TestAddressPolicy` | 6 | Public IPv4/IPv6 allowed; prohibited IPv4 and IPv6 classes; IPv4-mapped unwrap; 6to4 and NAT64 embedded IPv4 |
+| `TestGuardedResolver` | 14 | `127.0.0.1.nip.io` / `localtest.me`-style names resolving to loopback blocked; every prohibited class via DNS; mixed public+private answers fail closed; DNS failure, resolver timeout, empty/malformed answers fail closed; DNS-rebinding answer sequences validated on every resolution (no caching); IP literals validated without reaching the base resolver; scoped IPv6; errors are `OSError` subclasses so aiohttp wraps them |
+| `TestRedirectTracing` | 15 | Legitimate HTTP/HTTPS expansion; relative and protocol-relative redirects; redirects to loopback/private/link-local/metadata/IPv6/encoded hosts are never requested; bad scheme/credentials/port in redirects; oversized Location; multi-hop; redirect limit and truncation notice; loop detection (incl. case/fragment variants); overall deadline; network errors propagate |
+| `TestErrorClassification` | 2 | blocked / timeout / network classification through `os_error` and cause chains |
+| `TestWiringAndMessages` | 11 | Handler uses the bootstrap-owned guarded session, never a per-request or unguarded one; fails closed when missing; no host/exception text in replies; `logger` defined (regression); bootstrap creates and closes the session and shutdown order is preserved; guarded-session configuration; bounded constants; frozen file hash; `is_safe_host` not weakened |
+| `TestAiohttpConnectionPathEnforcement` | 7 | **Skipped without aiohttp.** Real `TCPConnector` + `GuardedResolver`: hostname→loopback, rebinding, mixed answers blocked by the connector; DNS failure not reported as blocked; IP literals stopped before the connector; yarl/validator host agreement; `create_guarded_session()` configuration |
+
+**Negative controls (run once, scratch copy, not committed):** removing the address-policy check made 84 tests fail; removing the resolver's answer validation made 21 tests fail.
+
+**Legacy tests updated (CHG-024):** `tests/test_phase2c_2k.py::TestPhase2J_ShortExpand` had 8 assertions that string-matched the old implementation inside `media/router.py` (`_safe(redir_host)`, `_safe(initial_host)`, `location.startswith("/")`, old message text, etc.). They now assert the equivalent properties in `app/utils/safe_url.py` and the new router text. No assertion was removed without an equivalent stronger check.
 
 ### `tests/test_markdown_safety.py` (46 tests, 25 pass, 21 skip)
 
@@ -139,6 +165,7 @@ Tests that verify parse_mode usage and html.escape() application.
 | Functionality | Test coverage |
 |---|---|
 | `/string` output never logged | `TestNoSecretsInLogs` — AST confirmed |
+| `/short expand` SSRF (resolving hostnames, rebinding, redirects, IPv6) | `tests/test_short_expand_ssrf.py` — 60 passing deterministic tests + 7 aiohttp integration tests (skipped without aiohttp) |
 | SSRF guard correctness | `TestSSRFGuard` — 15 vectors; `TestSSRFHardeningLibreTranslate` — 20 vectors; `TestSSRFEndpointSafetyFunction` — 11 unit tests; `TestIsEndpointSafePublicIPv6` — 3 IPv6 tests |
 | Orchestrator DEFECT-01 (no counter on user errors) | `TestOrchestratorDefect01Regression` — 5 regression tests |
 | Orchestrator cooldown/circuit-breaker | `TestOrchestratorCooldownAndRecovery` — 5 state tests |

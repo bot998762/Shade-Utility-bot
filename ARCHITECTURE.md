@@ -35,6 +35,9 @@ Step 1: settings.validate_startup()
 Step 2: aiohttp.ClientSession() opened
         → Shared HTTP client for all outbound requests.
         → Held for the entire process lifetime.
+        → CHG-024: a second, dedicated session `expand_session` is created
+          (create_guarded_session()) for user-supplied URLs only. Its connector
+          validates resolved addresses; it is never used by other features.
         
 Step 3: await bot.get_me()
         → Validates BOT_TOKEN is live.
@@ -102,6 +105,7 @@ Step 4: await shutdown_all_sessions()
         → Disconnects all active Telethon clients in ACTIVE_CLIENTS (session).
         
 Step 5: await _close_http_resources()
+        → expand_session.close()   (CHG-024)
         → http_session.close()
         → bot.session.close()
 ```
@@ -314,6 +318,27 @@ Pure Python functions: `gen_uuid`, `gen_password`, `check_password_strength`, `g
 
 ### `app/utils/network.py`
 `is_safe_host(host)` — SSRF guard. Blocks: private IP ranges, loopback, link-local, CGNAT (RFC 6598), benchmarking (RFC 2544), test-net ranges (RFC 5737), multicast, reserved, decimal-integer encoding, octal prefix, hex prefix, named internal hosts. No external dependencies.
+
+### `app/utils/safe_url.py` (CHG-024)
+Policy and connection-time enforcement for user-supplied URLs (`/short expand`). Stdlib only at import (aiohttp is imported lazily), so it is unit-testable without aiohttp.
+
+```
+/short expand <url>                     media/router.py::_cmd_short_expand
+  1. validate_public_http_url(url)      scheme / credentials / port / host / IP-literal policy
+  2. session = bootstrap_ref.expand_session   (missing or closed -> fail closed, no fallback)
+  3. trace_redirects(session, target)   HEAD, allow_redirects=False, max 5 hops, 20 s deadline
+       for each hop:
+         session.head(url)  ->  aiohttp TCPConnector
+                                 -> GuardedResolver.resolve(host)
+                                      validates EVERY answer; any prohibited /
+                                      malformed / empty answer -> fail closed
+                                 -> connects to the validated addresses; TLS verifies
+                                    the real hostname (SNI unchanged)
+         3xx Location -> urljoin -> validate_public_http_url -> loop check -> next hop
+  4. handler maps outcomes to generic user-facing text (no IPs / hosts / exception text)
+```
+
+Trust boundary: everything from the user and every redirect `Location` is untrusted; the resolver is the single point where destination addresses are decided. `is_safe_host()` is only a defence-in-depth internal-name check here. See SECURITY.md section 9.2.
 
 ### `app/utils/qr.py`
 `generate_qr_buffer(data)` → `io.BytesIO` containing PNG. `scan_qr_from_bytes(image_bytes)` → decoded string. Uses `qrcode`, `pyzbar`, `Pillow`.

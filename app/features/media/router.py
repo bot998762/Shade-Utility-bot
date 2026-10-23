@@ -22,9 +22,12 @@ from app.services.shortener_service import ShortenerService
 from app.services.translator_service import TranslatorService
 from app.utils import qr
 from app.core.exceptions import ProviderAPIError
+from app.core.logger import setup_logger
+from app.utils import safe_url as _su
 
 manifest = FeatureManifest(name="MediaTools", version="1.0.0", category="Utility")
 router = Router()
+logger = setup_logger()
 
 
 @router.message(Command("ocr"))
@@ -62,7 +65,11 @@ async def cmd_ocr(
 
 
 @router.message(Command("short"))
-async def cmd_short(message: Message, shortener_service: ShortenerService) -> None:
+async def cmd_short(
+    message: Message,
+    shortener_service: ShortenerService,
+    bootstrap_ref,
+) -> None:
     args = message.text.split(maxsplit=2)
     if len(args) < 2:
         await message.reply(
@@ -81,7 +88,7 @@ async def cmd_short(message: Message, shortener_service: ShortenerService) -> No
                 parse_mode="HTML",
             )
             return
-        await _cmd_short_expand(message, args[2].strip())
+        await _cmd_short_expand(message, args[2].strip(), bootstrap_ref)
         return
 
     # Existing shortening path — UNCHANGED
@@ -91,35 +98,42 @@ async def cmd_short(message: Message, shortener_service: ShortenerService) -> No
     await message.reply(f"🌐 <b>Shortened Direct Link:</b>\n{e_url}", parse_mode="HTML")
 
 
-async def _cmd_short_expand(message, raw_url: str) -> None:
-    """
-    Phase 2J — SSRF-safe URL expansion.
+# Initial-URL rejection reasons -> user-facing text (no host/IP echoed back).
+_EXPAND_URL_ERRORS = {
+    "scheme": "❌ Only http:// and https:// URLs are supported.",
+    "credentials": "❌ URLs containing credentials are not supported.",
+    "port": "❌ Invalid port in URL.",
+    "blocked": "❌ Private/reserved host in URL — cannot expand.",
+}
 
-    is_safe_host() is the security authority for every redirect hop.
-    We NEVER follow a redirect to a private/internal address.
+_MAX_REDIRECTS = _su.MAX_REDIRECTS
+
+
+async def _cmd_short_expand(message, raw_url: str, bootstrap_ref=None) -> None:
+    """
+    CHG-024 — SSRF-hardened URL expansion.
+
+    Security decisions are NOT made here by inspecting hostname strings. The
+    guarded session (bootstrap.expand_session) validates the resolved
+    destination addresses at connection time, and app.utils.safe_url
+    validates the URL and every redirect target before it is requested.
+    This handler only maps outcomes to user-facing text.
     """
     import html as _html
-    import aiohttp as _aiohttp
-    from urllib.parse import urlparse as _urlparse
-    from app.utils.network import is_safe_host as _safe
 
-    _MAX_REDIRECTS = 5
-
-    # Validate the initial URL
     try:
-        parsed = _urlparse(raw_url)
-        if parsed.scheme not in ("http", "https"):
-            await message.reply("❌ Only http:// and https:// URLs are supported.", parse_mode="HTML")
-            return
-        if not parsed.netloc:
-            raise ValueError("empty host")
-        initial_host = parsed.hostname or ""
-    except Exception:
-        await message.reply("❌ Invalid URL format.", parse_mode="HTML")
+        target = _su.validate_public_http_url(raw_url)
+    except _su.UnsafeURLError as exc:
+        await message.reply(
+            _EXPAND_URL_ERRORS.get(exc.code, "❌ Invalid URL format."),
+            parse_mode="HTML",
+        )
         return
 
-    if not _safe(initial_host):
-        await message.reply("❌ Private/reserved host in URL — cannot expand.", parse_mode="HTML")
+    # Fail closed: never fall back to an unguarded session.
+    session = getattr(bootstrap_ref, "expand_session", None)
+    if session is None or getattr(session, "closed", False):
+        await message.reply("❌ URL expansion is temporarily unavailable.", parse_mode="HTML")
         return
 
     status = await message.reply(
@@ -127,84 +141,51 @@ async def _cmd_short_expand(message, raw_url: str) -> None:
         parse_mode="HTML",
     )
 
-    hops: list[str] = [raw_url]
-    current_url = raw_url
-
     try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=15, connect=5)
-        connector = aiohttp.TCPConnector(limit=5)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            for _ in range(_MAX_REDIRECTS):
-                try:
-                    async with session.head(
-                        current_url,
-                        allow_redirects=False,
-                        timeout=timeout,
-                        headers={"User-Agent": "ShadeUtility/2J URLExpander"},
-                    ) as resp:
-                        if resp.status not in (301, 302, 303, 307, 308):
-                            break  # not a redirect — we've reached the final destination
-                        location = resp.headers.get("Location", "")
-                        if not location:
-                            break
-                        # Resolve relative redirects
-                        if location.startswith("/"):
-                            p = _urlparse(current_url)
-                            location = f"{p.scheme}://{p.netloc}{location}"
-                        # SSRF guard: validate EVERY redirect destination before following
-                        try:
-                            redir_parsed = _urlparse(location)
-                            redir_host = redir_parsed.hostname or ""
-                            if redir_parsed.scheme not in ("http", "https"):
-                                await status.edit_text(
-                                    f"⛔ Redirect to non-HTTP scheme blocked: "
-                                    f"<code>{_html.escape(redir_parsed.scheme)}</code>",
-                                    parse_mode="HTML",
-                                )
-                                return
-                            if not _safe(redir_host):
-                                await status.edit_text(
-                                    f"⛔ Redirect to private/internal host blocked: "
-                                    f"<code>{_html.escape(redir_host)}</code>",
-                                    parse_mode="HTML",
-                                )
-                                return
-                        except Exception:
-                            await status.edit_text(
-                                "⛔ Redirect destination could not be validated — expansion stopped.",
-                                parse_mode="HTML",
-                            )
-                            return
-
-                        hops.append(location)
-                        current_url = location
-                except (aiohttp.ServerTimeoutError, aiohttp.ClientConnectorError,
-                        aiohttp.ClientError) as exc:
-                    await status.edit_text(
-                        f"⏱️ Network error while tracing: <code>{_html.escape(type(exc).__name__)}</code>",
-                        parse_mode="HTML",
-                    )
-                    return
+        result = await _su.trace_redirects(session, target)
+    except _su.RedirectBlockedError as exc:
+        logger.warning({"event": "short_expand_redirect_blocked", "reason": exc.code})
+        if exc.code == "scheme":
+            text = "⛔ Redirect to non-HTTP scheme blocked."
+        else:
+            text = "⛔ Redirect to a private, internal or invalid destination blocked."
+        await status.edit_text(text, parse_mode="HTML")
+        return
+    except _su.RedirectLoopError:
+        await status.edit_text("⛔ Redirect loop detected — expansion stopped.", parse_mode="HTML")
+        return
     except Exception as exc:
-        logger.error({"event": "short_expand_error", "error": type(exc).__name__})
-        await status.edit_text("❌ Unexpected error during URL expansion.", parse_mode="HTML")
+        kind = _su.classify_network_error(exc)
+        logger.warning({
+            "event": "short_expand_failed",
+            "kind": kind,
+            "error": type(exc).__name__,
+        })
+        text = {
+            "blocked": "⛔ Destination is not allowed — cannot expand.",
+            "timeout": "⏱️ The request timed out while tracing.",
+        }.get(kind, "⏱️ Network error while tracing the URL.")
+        await status.edit_text(text, parse_mode="HTML")
         return
 
+    hops = result.hops
     final = hops[-1]
     hop_count = len(hops) - 1
     e_final = _html.escape(final)
-    if hop_count == 0:
-        result = f"🔗 <b>URL Expansion:</b>\nNo redirects found — URL already points directly to:\n<code>{e_final}</code>"
+    if hop_count == 0 and not result.truncated:
+        text = f"🔗 <b>URL Expansion:</b>\nNo redirects found — URL already points directly to:\n<code>{e_final}</code>"
     else:
         hop_lines = "\n".join(f"  {i+1}. <code>{_html.escape(h)}</code>" for i, h in enumerate(hops))
-        result = (
+        text = (
             f"🔗 <b>URL Expansion ({hop_count} redirect{'s' if hop_count != 1 else ''}):</b>\n"
             f"{hop_lines}\n"
             f"───────────────────────────\n"
-            f"✅ <b>Final destination:</b> <code>{e_final}</code>"
         )
-    await status.edit_text(result, parse_mode="HTML")
+        if result.truncated:
+            text += f"⚠️ Stopped after {_MAX_REDIRECTS} redirects — the chain continues.\n<b>Last URL reached:</b> <code>{e_final}</code>"
+        else:
+            text += f"✅ <b>Final destination:</b> <code>{e_final}</code>"
+    await status.edit_text(text, parse_mode="HTML")
 
 
 @router.message(Command("tr"))

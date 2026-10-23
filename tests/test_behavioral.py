@@ -496,7 +496,6 @@ class TestHealthReadinessLiveState(unittest.IsolatedAsyncioTestCase):
             from app.core import health
         except ImportError:
             self.skipTest("aiohttp not installed")
-        return health
         health._readiness.update({
             "ready": False,
             "bot_task": None,
@@ -517,6 +516,29 @@ class TestHealthReadinessLiveState(unittest.IsolatedAsyncioTestCase):
     async def test_readiness_503_before_startup(self):
         self._skip_no_aiohttp()
         h = self._reset_health()
+        resp = await h.readiness_handler(MagicMock())
+        self.assertEqual(resp.status, 503)
+
+    async def test_reset_health_discards_state_left_by_earlier_tests(self):
+        """Regression: _reset_health() once returned before resetting, so the
+        module-level readiness state leaked between tests (200 instead of 503)."""
+        self._skip_no_aiohttp()
+        from app.core import health
+        fake_task = MagicMock(spec=asyncio.Task)
+        fake_task.done.return_value = False
+        fake_session = MagicMock(); fake_session.closed = False
+        health.set_ready(
+            bot_task=fake_task,
+            http_session=fake_session,
+            features_loaded=5,
+            degraded_features=["x"],
+        )
+        h = self._reset_health()
+        self.assertFalse(h._readiness["ready"])
+        self.assertIsNone(h._readiness["bot_task"])
+        self.assertIsNone(h._readiness["http_session"])
+        self.assertEqual(h._readiness["features_loaded"], 0)
+        self.assertEqual(h._readiness["degraded_features"], [])
         resp = await h.readiness_handler(MagicMock())
         self.assertEqual(resp.status, 503)
 

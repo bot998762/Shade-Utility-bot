@@ -3,8 +3,31 @@ import qrcode
 from PIL import Image
 from pyzbar.pyzbar import decode as decode_qr
 
+def _raise_if_data_overflow(data: str) -> None:
+    """Raise ``DataOverflowError`` if *data* cannot fit in any QR version.
+
+    qrcode's auto-fit path (``fit=True``) assigns version 41 to
+    ``QRCode.version`` before checking capacity; the setter's range check
+    then raises a bare ``ValueError`` and the library's own
+    ``DataOverflowError`` is never reached (verified on qrcode 7.4.2, 8.0
+    and 8.2). Encoding at the fixed maximum version uses the capacity check
+    that does raise ``DataOverflowError``, so no message matching is needed.
+    Returns normally when the data does fit, so the caller can re-raise the
+    original, unrelated ``ValueError``.
+    """
+    probe = qrcode.QRCode(version=40)
+    probe.add_data(data)
+    probe.make(fit=False)
+
+
 def generate_qr_buffer(data: str) -> io.BytesIO:
-    qr_img = qrcode.make(data)
+    try:
+        qr_img = qrcode.make(data)
+    except ValueError:
+        # Oversized input surfaces as DataOverflowError (from the probe);
+        # any other ValueError is re-raised unchanged.
+        _raise_if_data_overflow(data)
+        raise
     bio = io.BytesIO()
     qr_img.save(bio, 'PNG')
     bio.seek(0)

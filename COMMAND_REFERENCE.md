@@ -344,20 +344,23 @@
 **Subcommand: Expand (Phase 2J)**
 - Input: `expand` keyword + short URL
 - Output: hop-by-hop redirect chain + final destination domain
-- SSRF protection: initial URL AND every redirect destination validated via `is_safe_host()`
+- SSRF protection (CHG-024): initial URL and every redirect target validated (`app/utils/safe_url.py`), and the actual destination addresses are validated at connection time by a guarded resolver — hostnames that resolve to private/loopback/link-local/etc. addresses are refused
 - Never auto-follows redirects — manual HEAD with `allow_redirects=False`
-- Non-HTTP schemes (e.g. `file://`, `ftp://`) blocked
-- Redirects to private/internal addresses blocked
-- Relative redirects resolved to absolute before validation
-- Max 5 redirects in chain
+- Non-HTTP schemes (e.g. `file://`, `ftp://`), embedded credentials and invalid ports rejected
+- Redirects to prohibited destinations are never followed; redirect loops detected
+- Relative and protocol-relative redirects resolved to absolute before validation
+- Max 5 redirects in chain (a notice is shown if the chain continues); 20 s overall deadline
 - Examples: `/short expand https://bit.ly/example` → shows redirect chain to final destination
-- Errors: `⛔ Redirect to private/internal host blocked` / `⛔ Redirect to non-HTTP scheme blocked`
+- Errors: `⛔ Redirect to a private, internal or invalid destination blocked.` / `⛔ Redirect to non-HTTP scheme blocked.` / `⛔ Redirect loop detected — expansion stopped.` / `⛔ Destination is not allowed — cannot expand.` / `⏱️ The request timed out while tracing.` / `⏱️ Network error while tracing the URL.` (no hosts, IPs or exception text are shown)
 
 **General errors:**
 - `❌ Usage: /short <url> or /short expand <url>` if no arguments
 - `❌ Only http:// and https:// URLs are supported.`
 - `❌ Invalid URL format.`
 - `❌ Private/reserved host in URL — cannot expand.`
+- `❌ URLs containing credentials are not supported.`
+- `❌ Invalid port in URL.`
+- `❌ URL expansion is temporarily unavailable.` (guarded session missing)
 **Category:** Media/URL Tools (MediaTools)
 **Dependencies:** stdlib `urllib.parse`; `aiohttp` for expand
 

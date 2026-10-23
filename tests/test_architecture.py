@@ -665,6 +665,40 @@ class TestQRDataOverflowHandling(unittest.TestCase):
         with self.assertRaises(DataOverflowError, msg="Oversized input must raise DataOverflowError"):
             generate_qr_buffer(oversized)
 
+    @needs_qrcode
+    def test_dataoverflow_not_plain_valueerror_for_oversized_input(self):
+        """Regression: qrcode's auto-fit path raises ValueError('Invalid version
+        (was 41...)') for oversized data; generate_qr_buffer must translate that
+        to DataOverflowError so cmd_qr shows its friendly message."""
+        from qrcode.exceptions import DataOverflowError
+        from app.utils.qr import generate_qr_buffer
+        try:
+            generate_qr_buffer("A" * 5000)
+        except DataOverflowError:
+            pass
+        except ValueError as exc:  # pragma: no cover - failure path
+            self.fail(f"oversized input leaked a plain ValueError: {exc}")
+        else:  # pragma: no cover - failure path
+            self.fail("oversized input did not raise")
+
+    @needs_qrcode
+    def test_max_capacity_input_still_generates_png(self):
+        """Large but valid input (fits version 40) must still succeed."""
+        from app.utils.qr import generate_qr_buffer
+        bio = generate_qr_buffer("A" * 2900)
+        self.assertEqual(bio.read(8), b"\x89PNG\r\n\x1a\n")
+
+    @needs_qrcode
+    def test_unrelated_valueerror_is_not_converted_to_overflow(self):
+        """A ValueError that is not a capacity problem must propagate unchanged."""
+        from qrcode.exceptions import DataOverflowError
+        from app.utils import qr as qr_mod
+        with patch.object(qr_mod.qrcode, "make", side_effect=ValueError("boom")):
+            with self.assertRaises(ValueError) as ctx:
+                qr_mod.generate_qr_buffer("small")
+        self.assertNotIsInstance(ctx.exception, DataOverflowError)
+        self.assertEqual(str(ctx.exception), "boom")
+
 
 
 class TestSSRFGuardAST(unittest.TestCase):

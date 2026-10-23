@@ -151,7 +151,7 @@ if user_id in ACTIVE_CLIENTS:
 
 Applied to: `/ip` command input, and LibreTranslate endpoint validation (see below).
 
-**Applies to:** `/ip` and LibreTranslate provider endpoint validation. The `/weather`, `/short`, `/tr`, `/ocr` commands use hardcoded URLs or service-controlled parameters and do not process user-supplied URLs as fetch targets.
+**Applies to:** `/ip` and LibreTranslate provider endpoint validation. `/weather`, `/tr`, `/ocr` and plain `/short <url>` use hardcoded provider URLs or service-controlled parameters. **`/short expand <url>` does fetch a user-supplied URL** and is protected by the connection-time design in section 9.2 (CHG-024); `is_safe_host()` alone was found insufficient for it (it accepts any non-IP hostname, including names that resolve to private addresses).
 
 **15 SSRF guard tests pass** (verified in test_behavioral.py `TestSSRFGuard`).
 
@@ -184,6 +184,58 @@ _is_endpoint_safe(url):
 **Opt-in escape hatch:** `LIBRETRANSLATE_ALLOW_PRIVATE_ENDPOINTS=1` — for intentional same-network self-hosted deployments only. Bypasses all range checks when set.
 
 **Test coverage:** `TestSSRFHardeningLibreTranslate` (20 tests) + `TestSSRFEndpointSafetyFunction` (11 tests) + `TestIsEndpointSafePublicIPv6` (3 tests) = 34 dedicated SSRF tests.
+
+### 9.2 `/short expand` — Connection-Time Destination Enforcement (CHG-024)
+
+**Root cause (confirmed from source):** `is_safe_host()` returns `True` for every non-IP hostname, and the previous `/short expand` code checked only that hostname text before letting aiohttp resolve and connect. `127.0.0.1.nip.io` and `localtest.me` passed the check (reproduced as a pure function call). Successful exploitation against a live deployment was **never demonstrated**; this was a source-confirmed weakness.
+
+**Design chosen:** a validating resolver plugged into aiohttp's `TCPConnector` (`GuardedResolver`, `app/utils/safe_url.py`). Alternatives considered and rejected:
+
+| Approach | Why not sufficient |
+|---|---|
+| Hostname-string validation only | Cannot know what a name resolves to |
+| Resolve once, check, then connect | Check-then-connect gap: a second resolution (DNS rebinding) can return a different address |
+| Connect to the pre-validated IP directly | Breaks HTTPS hostname verification / SNI unless extra work is done |
+| **Validate inside the connector's resolver (chosen)** | The exact address list that was validated is the one aiohttp connects to; every connection re-resolves (DNS cache off); URL keeps the real hostname so certificate verification and SNI are unchanged |
+
+**Controls implemented**
+
+| Control | Where |
+|---|---|
+| Only `http`/`https`; rejects malformed URLs, whitespace/control/backslash characters, embedded credentials, invalid ports (0, >65535, non-numeric), URLs over 2048 chars | `validate_public_http_url` |
+| Hostname normalisation (case, one trailing dot, IDNA, label rules); non-canonical numeric hosts (decimal, octal, hex, short IPv4) rejected rather than interpreted | `normalize_host` |
+| Prohibited destination addresses: loopback, private, link-local, unspecified, multicast, reserved, CGNAT and the other `network._BLOCKED_NETWORKS`, anything not globally routable, IPv4-mapped IPv6 and IPv4 embedded in 6to4/Teredo/NAT64 | `is_prohibited_ip` |
+| Every DNS answer validated at connection time; **any** prohibited, malformed or empty answer (including mixed public+private sets) fails closed; resolver timeout 5 s fails closed | `GuardedResolver` |
+| IP-literal URLs (aiohttp never calls the resolver for these) validated before every request, including every redirect | `validate_public_http_url` |
+| Every redirect `Location` resolved with `urljoin`, re-validated, never followed if rejected; loop detection; max 5 redirects; truncated chains are reported | `trace_redirects` |
+| HEAD only, `allow_redirects=False`, bodies never read | `trace_redirects` |
+| Per-request timeouts (10 s total / 5 s connect), 20 s overall deadline, pool limit 10 (3 per host) | `create_guarded_session`, `trace_redirects` |
+| Dedicated long-lived session owned by bootstrap (`expand_session`), closed in `_close_http_resources()`; **never** falls back to the unguarded shared session (replies "temporarily unavailable") | `bootstrap.py`, `media/router.py` |
+| `DummyCookieJar` (cookies from one user's redirect chain are never replayed for another), `trust_env=False` (environment proxies cannot bypass the resolver) | `create_guarded_session` |
+| Best-effort parser-differential check: aiohttp's own URL parser (yarl) must agree with the validated host | `_same_host_as_client_parser` |
+| User-visible errors are generic: no resolved IPs, no redirect hostnames, no exception text or class names; details go to logs as reason codes only | `_cmd_short_expand` |
+
+**Why a dedicated session instead of the shared `http_session`:** the shared session also serves ip-api, wttr.in, OCR.space and the URL shorteners, and LibreTranslate may legitimately use private endpoints (`LIBRETRANSLATE_ALLOW_PRIVATE_ENDPOINTS`). A global address filter would change those features.
+
+**Not changed:** `is_safe_host()` (FROZEN-04) is untouched. `/ip` and LibreTranslate behaviour is unchanged. For `/short expand`, `is_safe_host()` is now only a cheap internal-name check; it is no longer the security decision for hostnames.
+
+**Verification status (be precise)**
+
+| Claim | Status |
+|---|---|
+| URL policy, address policy (IPv4, IPv6, mapped, 6to4, NAT64), resolver decisions (mixed answers, DNS failure, timeout, malformed answers, rebinding sequence), redirect limits/loops/validation, error hygiene | Verified by 60 deterministic tests using fake resolvers and fake sessions (no network); also run on Python 3.11 and 3.12 |
+| Tests detect a weakened guard | Verified by negative control: with the address policy or the resolver check removed in a scratch copy, 84 / 21 tests failed |
+| aiohttp's real `TCPConnector` routes name resolution through `GuardedResolver` and surfaces the block as `ClientConnectorError` | **Not executed in the development environment** (aiohttp could not be installed there). 7 integration tests in `tests/test_short_expand_ssrf.py::TestAiohttpConnectionPathEnforcement` cover it and are **skipped** until run where aiohttp is installed |
+| Live exploitation / live penetration test | Not performed, before or after the fix |
+
+**Known limitations**
+- Hostnames whose DNS answers mix public and private addresses are rejected entirely (strict by design).
+- NAT64 (`64:ff9b::/96`) destinations are rejected as reserved.
+- Non-standard ports on public hosts are still allowed (only port validity is enforced).
+- Servers that reject `HEAD` (e.g. 405) are reported as the final destination, as before.
+- DNS answers come from the host's system resolver; a compromised resolver is out of scope.
+- The overall deadline (20 s) is tighter than the previous per-hop 15 s; very slow chains now time out.
+- No per-user rate limiting (see section 15).
 
 ---
 
@@ -329,3 +381,4 @@ Properties:
 | Unofficial Google Translate API | TimeoutError caught | No SLA, can break without notice |
 | ip-api.com HTTP (not HTTPS) | Intentional (free tier) | Response could be MiTM'd (geo data, not credentials) |
 | No per-user rate limiting | None | Resource exhaustion under sustained abuse |
+| `/short expand` SSRF via resolving hostnames / DNS rebinding | Connection-time `GuardedResolver`, per-hop URL validation (CHG-024, section 9.2) | aiohttp-level enforcement tests skipped where aiohttp is not installed; not live-tested |

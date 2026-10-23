@@ -546,34 +546,40 @@ class TestPhase2J_ShortExpand(unittest.TestCase):
 
     def setUp(self):
         self.src = (PROJECT_ROOT / "app/features/media/router.py").read_text()
+        # CHG-024: URL validation, redirect handling and the connection-time
+        # address guard moved to app/utils/safe_url.py. The assertions below
+        # that used to match the old hostname-string implementation now check
+        # the equivalent (stronger) properties there. Behavioural coverage is
+        # in tests/test_short_expand_ssrf.py.
+        self.mod_src = (PROJECT_ROOT / "app/utils/safe_url.py").read_text()
 
     def test_expand_subcommand_present(self):
         self.assertIn('"expand"', self.src.lower())
 
     def test_ssrf_guard_applied_per_hop(self):
-        """is_safe_host must be called inside the redirect loop."""
-        self.assertIn("_safe(redir_host)", self.src)
+        """Every redirect target must be validated inside the redirect loop."""
+        self.assertIn("validate_public_http_url(urljoin(current.url, location))", self.mod_src)
 
     def test_allow_redirects_false(self):
         """Manual redirect following; aiohttp must NOT auto-follow."""
-        self.assertIn("allow_redirects=False", self.src)
+        self.assertIn("allow_redirects=False", self.mod_src)
 
     def test_max_redirects_defined(self):
         self.assertIn("_MAX_REDIRECTS", self.src)
+        self.assertIn("MAX_REDIRECTS", self.mod_src)
 
     def test_existing_shortening_preserved(self):
         """Original shorten_url call must still be in the handler."""
         self.assertIn("shorten_url", self.src)
 
     def test_scheme_restricted_to_http_https(self):
-        self.assertIn("http", self.src)
-        self.assertIn('"https"', self.src)
+        self.assertIn('_ALLOWED_SCHEMES = ("http", "https")', self.mod_src)
         # non-HTTP schemes must be blocked
-        self.assertIn("not in (\"http\", \"https\")", self.src)
+        self.assertIn("scheme not in _ALLOWED_SCHEMES", self.mod_src)
 
     def test_private_host_redirect_blocked(self):
         """Source must explicitly block redirects to private hosts."""
-        self.assertIn("Redirect to private/internal host blocked", self.src)
+        self.assertIn("Redirect to a private, internal or invalid destination blocked", self.src)
 
     def test_non_scheme_redirect_blocked(self):
         self.assertIn("Redirect to non-HTTP scheme blocked", self.src)
@@ -581,9 +587,10 @@ class TestPhase2J_ShortExpand(unittest.TestCase):
     def test_max_redirects_at_most_10(self):
         """Redirect limit must be reasonable (≤10)."""
         import re
-        m = re.search(r"_MAX_REDIRECTS\s*=\s*(\d+)", self.src)
+        m = re.search(r"^MAX_REDIRECTS\s*=\s*(\d+)", self.mod_src, re.M)
         self.assertIsNotNone(m)
         self.assertLessEqual(int(m.group(1)), 10)
+        self.assertIn("_MAX_REDIRECTS = _su.MAX_REDIRECTS", self.src)
 
     def test_hops_collected(self):
         self.assertIn("hops", self.src)
@@ -592,12 +599,13 @@ class TestPhase2J_ShortExpand(unittest.TestCase):
         self.assertIn("_cmd_short_expand", self.src)
 
     def test_ssrf_guard_on_initial_url(self):
-        """Initial URL must also be SSRF-checked before the loop."""
-        self.assertIn("_safe(initial_host)", self.src)
+        """Initial URL must also be validated before any request is made."""
+        self.assertLess(self.src.index("_su.validate_public_http_url(raw_url)"),
+                        self.src.index("_su.trace_redirects(session, target)"))
 
     def test_relative_redirect_resolved(self):
-        """Source must resolve relative redirects like /path → absolute."""
-        self.assertIn('location.startswith("/")', self.src)
+        """Relative and protocol-relative redirects are resolved to absolute URLs."""
+        self.assertIn("urljoin(current.url, location)", self.mod_src)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
