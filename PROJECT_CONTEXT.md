@@ -767,6 +767,20 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### CHG-026 — Fix Long `/qr` Caption (Telegram 1,024-character limit)
+**Date:** 2026-10-23
+**Type:** Bug fix (source-supported; live incident not yet confirmed)
+**Problem:** `cmd_qr` sent the full input as the `reply_photo` caption. Telegram limits photo captions to 1,024 characters after entity parsing, while the QR code (default error correction) can encode roughly 1,000–2,300+ characters. Such input generated a valid PNG, then failed at upload; `PlatformErrorMiddleware` replied "⚠️ Internal system error occurred." Reproduced locally only up to the point of PNG generation and caption length; the Telegram rejection itself is inferred from the documented limit, not observed.
+**Not proven:** that this was the cause of the reported live failure. The deployed version is unknown (no version metadata); confirm from the production log line `unhandled_error` (a caption error would read "message caption is too long"; a pre-fix build would read "Invalid version (was 41, expected 1 to 40)").
+**Change:** `app/features/media/router.py` — new `_build_qr_caption()` (+ constants `_QR_CAPTION_LIMIT=900`, `_QR_CAPTION_PREVIEW_CHARS=200`, helper `_utf16_len`). Input that fits the budget (measured in UTF-16 units, after-parsing text) keeps the original caption byte-for-byte. Longer input gets a 200-code-point escaped preview plus "Input truncated: showing the first N of M characters. The QR code contains the full text." Escaping is applied after truncation; truncation is by code point. The QR image always encodes the full input. `cmd_qr` uses the helper; overflow handling (`QRDataOverflowError` → friendly message) and `app/utils/qr.py` are unchanged; no broad exception handling added.
+**Tests:** new `tests/test_qr_caption.py` (15): short text unchanged, escaping equal to the old output, budget boundary, 1,200/1,500/2,000-character inputs, full input still passed to the QR encoder, `<>&"'` + multibyte + emoji input, cut-point at entity/astral characters, worst cases, over-capacity → friendly message and no photo, unrelated `ValueError` propagates, usage message, upload errors not swallowed, no broad handler in `cmd_qr`, and 2 real-library tests. Lengths are measured after HTML parsing in UTF-16 units. Negative control: with truncation disabled, the length tests fail. `test_markdown_safety.py::test_qr_input_escaped` updated (escaping now lives in the helper).
+**Files changed:** `app/features/media/router.py`, `tests/test_qr_caption.py` (new), `tests/test_markdown_safety.py`, `TESTING.md`, `PROJECT_CONTEXT.md`
+**Files NOT changed:** `app/utils/qr.py`, `app/utils/safe_url.py` and all CHG-024 code, CHG-025 messages, `/tr`, `app/middlewares/*`, bootstrap, frozen files
+**Known limitations:** No live Telegram retest was performed. The overflow message still says "~2,900 bytes" although the default error-correction level holds about 2,331 bytes (wording not changed here). Captions for long input show only a preview.
+**Status:** COMPLETE locally; live retest pending
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -877,6 +891,9 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ### CHG-025 Verification
 - New message tests: 7 passed. Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d` unchanged; `safe_url.py`, `network.py`, `error.py`, `di.py`, `bootstrap.py` byte-identical to the pre-change snapshot. Tests passing do not by themselves establish SSRF security or production readiness.
+
+### CHG-026 Verification
+- Default sandbox: 514 passed, 171 skipped, 0 failed. With real qrcode 7.4.2 + aiohttp 3.9.1 sources: 542 passed, 143 skipped, 0 failed; SSRF file 74 passed. Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d`; CHG-024 files byte-identical to the pre-change snapshot. Live behaviour not verified.
 
 ## 12. KNOWN ISSUES
 

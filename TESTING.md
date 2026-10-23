@@ -14,9 +14,12 @@
 | `tests/test_phase2c_2k.py` | 128 | 128 | 0 | 0 | Phase 2C–2K features and architecture invariants |
 | `tests/test_session_manager.py` | 60 | 37 | 0 | 23 | Session manager flows |
 | `tests/test_short_expand_ssrf.py` | 74 | 67 | 0 | 7 | `/short expand` SSRF hardening (CHG-024) |
-| **TOTAL** | **670** | **501** | **0** | **169** | 136 subtests also passed |
+| `tests/test_qr_caption.py` | 15 | 13 | 0 | 2 | `/qr` caption length/escaping (CHG-026) |
+| **TOTAL** | **685** | **514** | **0** | **171** | 136 subtests also passed |
 
-Command: `/root/.local/bin/pytest tests/ -q` → `501 passed, 169 skipped, 136 subtests passed`.
+Command: `/root/.local/bin/pytest tests/ -q` → `514 passed, 171 skipped, 136 subtests passed`.
+
+**CHG-026:** new `tests/test_qr_caption.py` (15 collected: 13 run everywhere against a fake message/QR module, 2 need the real qrcode library). With real qrcode 7.4.2 and aiohttp 3.9.1 the full suite is 542 passed, 143 skipped, 0 failed. `test_markdown_safety.py::test_qr_input_escaped` was updated because caption escaping moved into `_build_qr_caption`.
 
 **CHG-025:** +7 handler-message tests in `test_short_expand_ssrf.py` (`TestExpandResultMessages`); they need no optional dependencies, so all 7 pass in the default sandbox. With real qrcode 7.4.2 and aiohttp 3.9.1 the full suite is 527 passed, 143 skipped, 0 failed.
 
@@ -24,7 +27,7 @@ Command: `/root/.local/bin/pytest tests/ -q` → `501 passed, 169 skipped, 136 s
 
 **Correction (CHG-024):** earlier versions of this table listed 433 total / 286 pass / 147 skip. That was wrong: it omitted `test_phase2c_2k.py` (128 tests) and listed `test_architecture.py` as 46 tests when it collects 77. The table above is taken from actual collection and per-file runs. Before CHG-024 the full suite was 434 passed / 158 skipped (592 collected); CHG-024 added 67 collected tests (60 pass, 7 skip).
 
-**Skipped tests are NOT passes.** Skip reasons in the current environment (`pytest -rs`): telethon not installed 86; aiogram not installed 32; deep_translator not installed 19; aiohttp not installed 21; pydantic_settings not installed 4; qrcode not installed 5; prometheus_client or other dependency not installed 2. Earlier notes attributing the behavioral skips to aiohttp alone were inaccurate.
+**Skipped tests are NOT passes.** Skip reasons in the current environment (`pytest -rs`): telethon not installed 86; aiogram not installed 32; deep_translator not installed 19; aiohttp not installed 21; pydantic_settings not installed 4; qrcode not installed 7; prometheus_client or other dependency not installed 2. Earlier notes attributing the behavioral skips to aiohttp alone were inaccurate.
 
 **Dead tests:** the 19 `deep_translator` skips can never run as written: `deep-translator` was removed from `requirements.txt` in CHG-021 and nothing in `app/` imports it.
 

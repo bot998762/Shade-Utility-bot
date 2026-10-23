@@ -213,6 +213,40 @@ async def cmd_translate(
     )
 
 
+# Telegram limits a photo caption to 1024 characters AFTER entity parsing (HTML
+# tags removed, entities such as &lt; counted as one character). A QR code can
+# hold more than that, so the caption must never simply repeat the input.
+# 900 is a conservative budget; length is measured in UTF-16 code units, which
+# is how Telegram counts, so astral characters (emoji) count as two.
+_QR_CAPTION_LIMIT = 900
+_QR_CAPTION_PREVIEW_CHARS = 200
+_QR_CAPTION_TITLE = "🔳 Generated QR Code Matrix:\n"
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _build_qr_caption(content: str) -> str:
+    """HTML caption for the QR photo, always within Telegram's limit.
+
+    Input that fits the budget keeps the original caption byte-for-byte.
+    Longer input is shown as a short escaped preview plus a truncation
+    notice; the QR image itself always carries the full text. Escaping is
+    applied after truncation and truncation is by code point, so neither an
+    HTML entity nor a character is ever cut in half.
+    """
+    if _utf16_len(_QR_CAPTION_TITLE) + _utf16_len(content) <= _QR_CAPTION_LIMIT:
+        return f"🔳 <b>Generated QR Code Matrix:</b>\n<code>{_html.escape(content)}</code>"
+    preview = content[:_QR_CAPTION_PREVIEW_CHARS]
+    return (
+        "🔳 <b>Generated QR Code Matrix:</b>\n"
+        f"<code>{_html.escape(preview)}</code>…\n"
+        f"ℹ️ Input truncated: showing the first {len(preview)} of {len(content)} "
+        "characters. The QR code contains the full text."
+    )
+
+
 @router.message(Command("qr"))
 async def cmd_qr(message: Message) -> None:
     args = message.text.split(maxsplit=1)
@@ -234,11 +268,11 @@ async def cmd_qr(message: Message) -> None:
         return
     try:
         input_file = BufferedInputFile(bio.getvalue(), filename="qrcode.png")
-        # User-supplied QR content can contain any characters — escape for HTML caption
-        e_content = _html.escape(content)
+        # User-supplied QR content can contain any characters; the caption is
+        # escaped and length-limited by _build_qr_caption (CHG-026).
         await message.reply_photo(
             photo=input_file,
-            caption=f"🔳 <b>Generated QR Code Matrix:</b>\n<code>{e_content}</code>",
+            caption=_build_qr_caption(content),
             parse_mode="HTML",
         )
     finally:

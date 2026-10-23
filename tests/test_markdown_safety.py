@@ -481,8 +481,17 @@ class TestMediaHandlerMarkdownSafety(unittest.TestCase):
             "OCR output must be html.escape()d — extracted text can contain backticks")
 
     def test_qr_input_escaped(self):
+        # CHG-026: caption building (escaping + length limit) moved into the
+        # _build_qr_caption helper; cmd_qr must use it and it must escape.
         src = self._get_handler_src("cmd_qr")
-        self.assertIn("_html.escape", src,
+        self.assertIn("_build_qr_caption(content)", src,
+            "cmd_qr must build its caption through _build_qr_caption")
+        router_src = (PROJECT_ROOT / "app/features/media/router.py").read_text()
+        helper = next(
+            ast.unparse(n) for n in ast.walk(ast.parse(router_src))
+            if isinstance(n, ast.FunctionDef) and n.name == "_build_qr_caption"
+        )
+        self.assertIn("_html.escape", helper,
             "QR content (user input) must be html.escape()d")
 
     def test_qrscan_output_escaped(self):
