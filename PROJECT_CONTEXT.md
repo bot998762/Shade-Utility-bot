@@ -753,6 +753,20 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### CHG-025 — Clarify "/short expand" No-Redirect Message
+**Date:** 2026-10-23
+**Type:** User-facing wording change (no network or security change)
+**Problem:** For URLs where no HTTP redirect is seen, the reply said "No redirects found — URL already points directly to: <url>", implying the input is the final destination. Observed with `https://v.gd/UUSMmS`: v.gd serves a preview/landing page (HTTP 200, destination shown as a click-required link — no 3xx/Location, meta refresh or JavaScript redirect per a web fetch of the page). `/short expand` traces only HTTP redirect statuses with `Location` using HEAD, so it correctly reports zero hops, but the wording was misleading. Servers that reject HEAD are reported the same way (already a documented CHG-024 limitation).
+**Decision (steelman):** (a) reword only — chosen: no new attack surface, honest about what was checked; (b) GET fallback — rejected here: new network behaviour, does not help preview pages; (c) provider-specific v.gd/is.gd handling or HTML/meta-refresh parsing — rejected: per-provider maintenance and parsing attacker-controlled content; JavaScript is never executed.
+**Change:** `app/features/media/router.py::_cmd_short_expand` — the zero-hop, non-truncated message now reads "No HTTP redirect was detected for: <url> / This may be a landing or preview page, so the actual destination may differ." The original URL stays visible (HTML-escaped). Redirect-chain, truncation, loop, blocked-destination, timeout and network-error messages are unchanged.
+**Tests:** `tests/test_short_expand_ssrf.py::TestExpandResultMessages` (+7; run the extracted handler against a fake message and fake `trace_redirects`, no network): new wording, HTML escaping, 1- and multi-hop output unchanged, truncation unchanged, six error outcomes unchanged and distinct, invalid URL rejected before tracing. Negative control: the new-wording test fails against the old handler.
+**Files changed:** `app/features/media/router.py`, `tests/test_short_expand_ssrf.py`, `TESTING.md`, `PROJECT_CONTEXT.md`
+**Files NOT changed:** `app/utils/safe_url.py`, `GuardedResolver`, session configuration, redirect limits, bootstrap, `/tr`, frozen files, `requirements.txt`
+**Known limitations:** The bot still cannot show the real destination of preview/landing-page shorteners or of servers that answer HEAD differently from GET; HEAD-vs-GET behaviour for v.gd was not measured (network blocked in the dev sandbox).
+**Status:** COMPLETE
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -860,6 +874,9 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 - Default sandbox (no optional deps): 494 passed, 169 skipped, 0 failed (4 new tests skip without deps).
 - Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d` unchanged; `error.py`, `di.py`, `network.py`, `safe_url.py` byte-identical to the pre-change snapshot.
 - Skips are not counted as passes.
+
+### CHG-025 Verification
+- New message tests: 7 passed. Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d` unchanged; `safe_url.py`, `network.py`, `error.py`, `di.py`, `bootstrap.py` byte-identical to the pre-change snapshot. Tests passing do not by themselves establish SSRF security or production readiness.
 
 ## 12. KNOWN ISSUES
 

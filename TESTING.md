@@ -13,10 +13,12 @@
 | `tests/test_markdown_safety.py` | 46 | 25 | 0 | 21 | Parse mode / escaping |
 | `tests/test_phase2c_2k.py` | 128 | 128 | 0 | 0 | Phase 2C–2K features and architecture invariants |
 | `tests/test_session_manager.py` | 60 | 37 | 0 | 23 | Session manager flows |
-| `tests/test_short_expand_ssrf.py` | 67 | 60 | 0 | 7 | `/short expand` SSRF hardening (CHG-024) |
-| **TOTAL** | **663** | **494** | **0** | **169** | 136 subtests also passed |
+| `tests/test_short_expand_ssrf.py` | 74 | 67 | 0 | 7 | `/short expand` SSRF hardening (CHG-024) |
+| **TOTAL** | **670** | **501** | **0** | **169** | 136 subtests also passed |
 
-Command: `/root/.local/bin/pytest tests/ -q` → `494 passed, 169 skipped, 136 subtests passed`.
+Command: `/root/.local/bin/pytest tests/ -q` → `501 passed, 169 skipped, 136 subtests passed`.
+
+**CHG-025:** +7 handler-message tests in `test_short_expand_ssrf.py` (`TestExpandResultMessages`); they need no optional dependencies, so all 7 pass in the default sandbox. With real qrcode 7.4.2 and aiohttp 3.9.1 the full suite is 527 passed, 143 skipped, 0 failed.
 
 **CHG-024 follow-up:** +4 tests (3 QR overflow regression, 1 health-state isolation) that skip without optional deps. With real qrcode 7.4.2 and aiohttp 3.9.1 available, the full suite is 520 passed, 143 skipped, 0 failed (aiogram, telethon and pyzbar still absent).
 

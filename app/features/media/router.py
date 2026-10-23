@@ -173,7 +173,15 @@ async def _cmd_short_expand(message, raw_url: str, bootstrap_ref=None) -> None:
     hop_count = len(hops) - 1
     e_final = _html.escape(final)
     if hop_count == 0 and not result.truncated:
-        text = f"🔗 <b>URL Expansion:</b>\nNo redirects found — URL already points directly to:\n<code>{e_final}</code>"
+        # No HTTP redirect (3xx + Location) was seen. That does NOT prove the
+        # URL is the real destination: some shorteners (e.g. v.gd) answer with
+        # a landing/preview page that only shows the target as a clickable link.
+        text = (
+            "🔗 <b>URL Expansion:</b>\n"
+            "No HTTP redirect was detected for:\n"
+            f"<code>{e_final}</code>\n"
+            "ℹ️ This may be a landing or preview page, so the actual destination may differ."
+        )
     else:
         hop_lines = "\n".join(f"  {i+1}. <code>{_html.escape(h)}</code>" for i, h in enumerate(hops))
         text = (

@@ -642,5 +642,132 @@ class TestAiohttpConnectionPathEnforcement(unittest.IsolatedAsyncioTestCase):
             await session.close()
 
 
+class TestExpandResultMessages(unittest.IsolatedAsyncioTestCase):
+    """CHG-025 — user-facing text of _cmd_short_expand for each outcome.
+
+    The handler's source is extracted from media/router.py (aiogram is not
+    needed) and run against a fake message and a fake trace_redirects, so no
+    network is used. Only message text is under test; SSRF logic is in
+    safe_url and covered elsewhere in this file.
+    """
+
+    URL = "https://v.gd/UUSMmS"
+
+    def _handler(self, trace):
+        import types
+        src = (PROJECT_ROOT / "app/features/media/router.py").read_text()
+        tree = ast.parse(src)
+        wanted = []
+        for n in tree.body:
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "_cmd_short_expand":
+                wanted.append(n)
+            elif isinstance(n, ast.Assign) and any(
+                getattr(t, "id", "") in ("_EXPAND_URL_ERRORS", "_MAX_REDIRECTS") for t in n.targets
+            ):
+                wanted.append(n)
+        self.assertEqual(len(wanted), 3)
+        fake_su = types.SimpleNamespace(**{k: getattr(su, k) for k in dir(su) if not k.startswith("__")})
+        fake_su.trace_redirects = trace
+        quiet = types.SimpleNamespace(warning=lambda *a, **k: None)
+        ns = {"_su": fake_su, "logger": quiet}
+        exec(compile(ast.Module(body=wanted, type_ignores=[]), "router_extract", "exec"), ns)
+        return ns["_cmd_short_expand"]
+
+    async def _run(self, trace, url=None):
+        edits = []
+
+        class Status:
+            async def edit_text(self_, text, **kw):
+                edits.append(text)
+
+        class Msg:
+            async def reply(self_, text, **kw):
+                return Status()
+
+        class Boot:
+            expand_session = type("S", (), {"closed": False})()
+
+        await self._handler(trace)(Msg(), url or self.URL, Boot())
+        self.assertEqual(len(edits), 1)
+        return edits[0]
+
+    async def test_no_redirect_message_is_clarified(self):
+        async def trace(session, target):
+            return su.TraceResult([target.url], False)
+        text = await self._run(trace)
+        self.assertIn("No HTTP redirect was detected", text)
+        self.assertIn("landing or preview page", text)
+        self.assertIn("actual destination may differ", text)
+        self.assertIn(f"<code>{self.URL}</code>", text, "original URL must stay visible")
+        self.assertNotIn("No redirects found", text)
+        self.assertNotIn("already points directly", text)
+
+    async def test_no_redirect_message_escapes_html(self):
+        async def trace(session, target):
+            return su.TraceResult([target.url], False)
+        text = await self._run(trace, "https://example.com/?a=<b>&c=1")
+        self.assertNotIn("<b>&c", text)
+        self.assertIn("&lt;b&gt;", text)
+
+    async def test_actual_redirect_result_unchanged(self):
+        async def trace(session, target):
+            return su.TraceResult([target.url, "https://example.org/final"], False)
+        text = await self._run(trace)
+        self.assertIn("URL Expansion (1 redirect):", text)
+        self.assertIn("1. <code>https://v.gd/UUSMmS</code>", text)
+        self.assertIn("2. <code>https://example.org/final</code>", text)
+        self.assertIn("✅ <b>Final destination:</b> <code>https://example.org/final</code>", text)
+        self.assertNotIn("preview page", text)
+
+    async def test_multi_hop_plural(self):
+        async def trace(session, target):
+            return su.TraceResult([target.url, "https://a.example/", "https://b.example/"], False)
+        text = await self._run(trace)
+        self.assertIn("URL Expansion (2 redirects):", text)
+
+    async def test_truncated_chain_unchanged(self):
+        async def trace(session, target):
+            return su.TraceResult([target.url, "https://a.example/"], True)
+        text = await self._run(trace)
+        self.assertIn("Stopped after 5 redirects — the chain continues.", text)
+        self.assertIn("<b>Last URL reached:</b> <code>https://a.example/</code>", text)
+        self.assertNotIn("preview page", text)
+
+    async def test_error_outcomes_unchanged_and_distinct(self):
+        cases = [
+            (su.RedirectBlockedError("blocked"), "⛔ Redirect to a private, internal or invalid destination blocked."),
+            (su.RedirectBlockedError("scheme"), "⛔ Redirect to non-HTTP scheme blocked."),
+            (su.RedirectLoopError(), "⛔ Redirect loop detected — expansion stopped."),
+            (asyncio.TimeoutError(), "⏱️ The request timed out while tracing."),
+            (su.BlockedDestinationError("x"), "⛔ Destination is not allowed — cannot expand."),
+            (ConnectionResetError("x"), "⏱️ Network error while tracing the URL."),
+        ]
+        for exc, expected in cases:
+            async def trace(session, target, _e=exc):
+                raise _e
+            text = await self._run(trace)
+            self.assertEqual(text, expected, type(exc).__name__)
+            self.assertNotIn("No HTTP redirect", text)
+
+    async def test_invalid_url_rejected_before_tracing(self):
+        calls = []
+
+        async def trace(session, target):
+            calls.append(target)
+            return su.TraceResult([target.url], False)
+        replies = []
+
+        class Msg:
+            async def reply(self_, text, **kw):
+                replies.append(text)
+
+        class Boot:
+            expand_session = object()
+
+        await self._handler(trace)(Msg(), "http://127.0.0.1/", Boot())
+        self.assertEqual(calls, [])
+        self.assertEqual(replies, ["❌ Private/reserved host in URL — cannot expand."])
+
+
 if __name__ == "__main__":
     unittest.main()
