@@ -20,7 +20,21 @@ def _raise_if_data_overflow(data: str) -> None:
     probe.make(fit=False)
 
 
-def generate_qr_buffer(data: str) -> io.BytesIO:
+def _version_from_image(qr_img) -> int | None:
+    """QR version (1-40) of an image returned by ``qrcode.make``, or None.
+
+    ``width`` is the module count per side (17 + 4 * version) in qrcode 7.x
+    and 8.x. If the attribute is missing or odd the version is unknown and
+    callers simply skip density-based hints (fail safe).
+    """
+    modules = getattr(qr_img, "width", None)
+    if isinstance(modules, int) and modules >= 21 and (modules - 17) % 4 == 0:
+        return (modules - 17) // 4
+    return None
+
+
+def generate_qr_with_version(data: str) -> tuple[io.BytesIO, int | None]:
+    """Return ``(png_buffer, qr_version)``; the version is None if unknown."""
     try:
         qr_img = qrcode.make(data)
     except ValueError:
@@ -28,10 +42,16 @@ def generate_qr_buffer(data: str) -> io.BytesIO:
         # any other ValueError is re-raised unchanged.
         _raise_if_data_overflow(data)
         raise
+    version = _version_from_image(qr_img)
     bio = io.BytesIO()
     qr_img.save(bio, 'PNG')
     bio.seek(0)
-    return bio
+    return bio, version
+
+
+def generate_qr_buffer(data: str) -> io.BytesIO:
+    """Unchanged public API: the PNG buffer only."""
+    return generate_qr_with_version(data)[0]
 
 def scan_qr_from_bytes(image_bytes: bytes) -> str:
     """Legacy single-result scan — preserved for backward compatibility."""

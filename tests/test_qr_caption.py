@@ -58,7 +58,7 @@ def utf16_len(text: str) -> int:
 def _load_router_pieces(fake_qr):
     src = (PROJECT_ROOT / "app/features/media/router.py").read_text()
     names = {"_utf16_len", "_build_qr_caption", "cmd_qr"}
-    assigns = {"_QR_CAPTION_LIMIT", "_QR_CAPTION_PREVIEW_CHARS", "_QR_CAPTION_TITLE"}
+    assigns = {"_QR_CAPTION_LIMIT", "_QR_CAPTION_PREVIEW_CHARS", "_QR_CAPTION_TITLE", "_QR_DENSE_VERSION"}
     body = []
     for n in ast.parse(src).body:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names:
@@ -92,8 +92,11 @@ class _Msg:
         self.photos.append((photo, caption, parse_mode))
 
 
-def _fake_qr(generate):
-    return types.SimpleNamespace(generate_qr_buffer=generate)
+def _fake_qr(generate, version=None):
+    """Fake app.utils.qr: ``generate(data)`` returns the buffer (or raises)."""
+    return types.SimpleNamespace(
+        generate_qr_with_version=lambda data: (generate(data), version),
+    )
 
 
 def _png_ok(data):
@@ -102,8 +105,8 @@ def _png_ok(data):
 
 class TestQrCaption(unittest.IsolatedAsyncioTestCase):
 
-    async def _send(self, content, generate=_png_ok):
-        ns = _load_router_pieces(_fake_qr(generate))
+    async def _send(self, content, generate=_png_ok, version=None):
+        ns = _load_router_pieces(_fake_qr(generate, version))
         msg = _Msg(f"/qr {content}")
         await ns["cmd_qr"](msg)
         return msg, ns
@@ -206,6 +209,10 @@ class TestQrCaption(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msg.photos, [])
         (text, kw), = msg.replies
         self.assertIn("Data too large for QR code", text)
+        self.assertIn("Capacity depends on the text and its encoding", text)
+        self.assertIn("Please shorten the input and try again.", text)
+        self.assertNotIn("2,900", text, "no fixed byte limit may be promised")
+        self.assertNotIn("support up to", text)
         self.assertEqual(kw.get("parse_mode"), "HTML")
 
     async def test_unrelated_value_error_propagates_unchanged(self):
@@ -238,6 +245,67 @@ class TestQrCaption(unittest.IsolatedAsyncioTestCase):
                   if isinstance(n, ast.AsyncFunctionDef) and n.name == "cmd_qr")
         handlers = [h for n in ast.walk(fn) if isinstance(n, ast.Try) for h in n.handlers]
         self.assertEqual([ast.unparse(h.type) for h in handlers], ["QRDataOverflowError"])
+
+    # ── CHG-027: dense-code hint (decided on the QR version, not input length) ──
+
+    DENSE_MARK = "Dense QR code"
+
+    async def test_dense_hint_only_at_or_above_threshold(self):
+        ns = _load_router_pieces(_fake_qr(_png_ok))
+        threshold = ns["_QR_DENSE_VERSION"]
+        self.assertEqual(threshold, 29)
+        content = "short text"
+        plain = ns["_build_qr_caption"](content)
+        for version in (None, 1, 10, threshold - 1):
+            self.assertEqual(ns["_build_qr_caption"](content, version), plain, version)
+            self.assertNotIn(self.DENSE_MARK, ns["_build_qr_caption"](content, version))
+        for version in (threshold, 35, 40):
+            cap = ns["_build_qr_caption"](content, version)
+            self.assertIn(self.DENSE_MARK, cap)
+            self.assertIn(f"version {version}", cap)
+            self.assertTrue(cap.startswith(plain))
+
+    async def test_dense_hint_makes_no_verification_claim(self):
+        ns = _load_router_pieces(_fake_qr(_png_ok))
+        cap = parsed_text(ns["_build_qr_caption"]("x" * 1500, 38)).lower()
+        for forbidden in ("verified", "decoded", "guarantee", "will scan", "tested"):
+            self.assertNotIn(forbidden, cap)
+        self.assertIn("may be hard to scan", cap)
+
+    async def test_short_caption_unchanged_when_version_known_but_not_dense(self):
+        msg, _ = await self._send("hello world", version=1)
+        (_, caption, _), = msg.photos
+        self.assertEqual(caption, "🔳 <b>Generated QR Code Matrix:</b>\n<code>hello world</code>")
+
+    async def test_dense_caption_stays_within_limit_for_all_input_shapes(self):
+        shapes = ("a" * 1500, "\U0001F600" * 1500, "&" * 3000, "<>" * 2000, "x" * 40)
+        for content in shapes:
+            for version in (29, 40):
+                msg, _ = await self._send(content, version=version)
+                (_, caption, _), = msg.photos
+                visible = self._caption_ok(caption)
+                self.assertIn(self.DENSE_MARK, visible)
+
+    async def test_dense_hint_added_after_truncation_notice_not_inside_code(self):
+        msg, _ = await self._send("q" * 1500, version=38)
+        (_, caption, _), = msg.photos
+        code_end = caption.index("</code>")
+        self.assertNotIn(self.DENSE_MARK, caption[:code_end])
+        self.assertLess(caption.index("Input truncated"), caption.index(self.DENSE_MARK))
+
+    async def test_dense_hint_budget_pushes_borderline_input_to_truncated_form(self):
+        ns = _load_router_pieces(_fake_qr(_png_ok))
+        room = ns["_QR_CAPTION_LIMIT"] - utf16_len(ns["_QR_CAPTION_TITLE"])
+        fits_plain = "x" * (room - 5)           # fits without a hint...
+        self.assertNotIn("truncated", ns["_build_qr_caption"](fits_plain))
+        with_hint = ns["_build_qr_caption"](fits_plain, 35)   # ...not with the hint
+        self.assertIn("truncated", with_hint)
+        self.assertLessEqual(utf16_len(parsed_text(with_hint)), TELEGRAM_CAPTION_LIMIT)
+
+    async def test_unknown_version_adds_nothing(self):
+        msg, _ = await self._send("A" * 1500, version=None)
+        (_, caption, _), = msg.photos
+        self.assertNotIn(self.DENSE_MARK, caption)
 
     async def test_usage_message_without_argument_unchanged(self):
         ns = _load_router_pieces(_fake_qr(_png_ok))
@@ -292,6 +360,120 @@ class TestQrCaptionWithRealQrLibrary(unittest.IsolatedAsyncioTestCase):
             gen("A" * 10000)
         with patch("qrcode.make", side_effect=ValueError("boom")), self.assertRaises(ValueError):
             gen("hi")
+
+
+@unittest.skipUnless(_HAVE_QRCODE, "qrcode not installed")
+class TestQrCapacityAndVersionWithRealLibrary(unittest.IsolatedAsyncioTestCase):
+    """CHG-027 — real qrcode (default error correction M): capacity depends on
+    the content's encoding mode, and the reported version drives the hint."""
+
+    def _qr_mod(self):
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+        try:
+            from app.utils import qr as qr_mod
+        except ImportError as exc:  # e.g. pyzbar/libzbar missing
+            self.skipTest(f"app.utils.qr not importable: {exc}")
+        return qr_mod
+
+    async def _cmd(self, content):
+        qr_mod = self._qr_mod()
+        ns = _load_router_pieces(types.SimpleNamespace(
+            generate_qr_with_version=qr_mod.generate_qr_with_version))
+        msg = _Msg(f"/qr {content}")
+        await ns["cmd_qr"](msg)
+        return msg
+
+    def test_version_helper_maps_module_count(self):
+        qr_mod = self._qr_mod()
+        v = qr_mod._version_from_image
+        self.assertEqual(v(types.SimpleNamespace(width=21)), 1)
+        self.assertEqual(v(types.SimpleNamespace(width=133)), 29)
+        self.assertEqual(v(types.SimpleNamespace(width=177)), 40)
+        for bad in (types.SimpleNamespace(), types.SimpleNamespace(width=None),
+                    types.SimpleNamespace(width=22), types.SimpleNamespace(width="21"),
+                    types.SimpleNamespace(width=17)):
+            self.assertIsNone(v(bad))
+
+    def test_generate_with_version_reports_real_version_and_keeps_buffer_api(self):
+        qr_mod = self._qr_mod()
+        bio, version = qr_mod.generate_qr_with_version("hello")
+        self.assertEqual(version, 1)
+        self.assertEqual(bio.read(8), b"\x89PNG\r\n\x1a\n")
+        old = qr_mod.generate_qr_buffer("hello")
+        self.assertIsInstance(old, io.BytesIO)
+        bio.seek(0)
+        self.assertEqual(old.getvalue(), bio.getvalue())
+
+    def test_equal_length_inputs_have_different_capacity(self):
+        from qrcode.exceptions import DataOverflowError
+        qr_mod = self._qr_mod()
+        _, v_upper = qr_mod.generate_qr_with_version("A" * 2900)   # alphanumeric mode
+        self.assertEqual(v_upper, 38)
+        with self.assertRaises(DataOverflowError):
+            qr_mod.generate_qr_with_version("a" * 2900)            # byte mode, > 2331 bytes
+        with self.assertRaises(DataOverflowError):
+            qr_mod.generate_qr_with_version("Aa" * 1450)
+        qr_mod.generate_qr_with_version("a" * 2331)                # exact byte-mode limit
+        with self.assertRaises(DataOverflowError):
+            qr_mod.generate_qr_with_version("a" * 2332)
+
+    def test_digits_and_uppercase_capacity_limits(self):
+        from qrcode.exceptions import DataOverflowError
+        qr_mod = self._qr_mod()
+        qr_mod.generate_qr_with_version("1" * 5596)
+        with self.assertRaises(DataOverflowError):
+            qr_mod.generate_qr_with_version("1" * 5597)
+        qr_mod.generate_qr_with_version("A" * 3391)
+        with self.assertRaises(DataOverflowError):
+            qr_mod.generate_qr_with_version("A" * 3392)
+
+    def test_multibyte_text_is_measured_in_utf8_bytes(self):
+        from qrcode.exceptions import DataOverflowError
+        qr_mod = self._qr_mod()
+        for text in ("\u00e9" * 1100, "\u20ac" * 770, "\u4e2d\u6587" * 385):  # <= 2331 bytes
+            self.assertLessEqual(len(text.encode("utf-8")), 2331)
+            qr_mod.generate_qr_with_version(text)
+        for text in ("\u20ac" * 780, "\U0001F600" * 590):    # > 2331 bytes though < 2331 chars
+            self.assertGreater(len(text.encode("utf-8")), 2331)
+            self.assertLess(len(text), 2331)
+            with self.assertRaises(DataOverflowError):
+                qr_mod.generate_qr_with_version(text)
+
+    def test_version_threshold_inputs(self):
+        qr_mod = self._qr_mod()
+        self.assertEqual(qr_mod.generate_qr_with_version("a" * 1190)[1], 28)
+        self.assertEqual(qr_mod.generate_qr_with_version("a" * 1191)[1], 29)
+
+    async def test_cmd_qr_dense_hint_only_for_dense_codes(self):
+        short = await self._cmd("hello")
+        self.assertEqual(short.photos[0][1],
+                         "🔳 <b>Generated QR Code Matrix:</b>\n<code>hello</code>")
+        ordinary = await self._cmd("a" * 1000)                 # truncated caption, version < 29
+        self.assertNotIn("Dense QR code", ordinary.photos[0][1])
+        self.assertIn("truncated", ordinary.photos[0][1])
+        dense = await self._cmd("a" * 1191)                    # version 29
+        self.assertIn("Dense QR code (version 29)", dense.photos[0][1])
+        very_dense = await self._cmd("A" * 2900)               # the live case: version 38
+        cap = very_dense.photos[0][1]
+        self.assertIn("Dense QR code (version 38)", cap)
+        self.assertLessEqual(utf16_len(parsed_text(cap)), 900)
+
+    async def test_cmd_qr_overflow_with_real_library_sends_message_and_no_photo(self):
+        # The real library raises the REAL DataOverflowError; the extracted
+        # handler catches the fake one, so use the real class for this check.
+        from qrcode.exceptions import DataOverflowError
+        qr_mod = self._qr_mod()
+        ns = _load_router_pieces(types.SimpleNamespace(
+            generate_qr_with_version=qr_mod.generate_qr_with_version))
+        ns["cmd_qr"].__globals__["QRDataOverflowError"] = DataOverflowError
+        msg = _Msg("/qr " + "a" * 2900)
+        await ns["cmd_qr"](msg)
+        self.assertEqual(msg.photos, [])
+        (text, kw), = msg.replies
+        self.assertIn("Capacity depends on the text and its encoding", text)
+        self.assertNotIn("2,900", text)
+        self.assertEqual(kw.get("parse_mode"), "HTML")
 
 
 if __name__ == "__main__":

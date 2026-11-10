@@ -24,10 +24,59 @@ from app.utils import qr
 from app.core.exceptions import ProviderAPIError
 from app.core.logger import setup_logger
 from app.utils import safe_url as _su
+from app.utils import telegram_text as _tt
 
 manifest = FeatureManifest(name="MediaTools", version="1.0.0", category="Utility")
 router = Router()
 logger = setup_logger()
+
+# CHG-028 — /ocr output must never exceed Telegram's message size. A result that
+# fits one message is sent exactly as before; longer text is split into at most
+# _OCR_MAX_MESSAGES escaped <code> blocks with an explicit truncation notice.
+_OCR_MAX_MESSAGES = 4
+_OCR_RULE = "───────────────────────────"
+_OCR_TITLE = "📝 OCR Extracted Result:"
+_OCR_FOOTER = "Tap text block to copy."
+# Worst-case literal (non-markup) text around a chunk, used to size the chunks.
+_OCR_CHUNK_OVERHEAD = (
+    f"📝 OCR Extracted Result (part {_OCR_MAX_MESSAGES} of {_OCR_MAX_MESSAGES}):\n"
+    f"{_OCR_RULE}\n\n{_OCR_RULE}\n{_OCR_FOOTER}\n"
+    "⚠️ Output truncated: 9999999 more characters not shown."
+)
+
+
+def _ocr_single_html(text: str) -> str:
+    return (
+        f"📝 <b>OCR Extracted Result:</b>\n"
+        f"{_OCR_RULE}\n"
+        f"<code>{_html.escape(text)}</code>\n"
+        f"{_OCR_RULE}\n"
+        f"<i>{_OCR_FOOTER}</i>"
+    )
+
+
+def _ocr_messages(text: str) -> list[str]:
+    """HTML messages for an OCR result, each within Telegram's size limit."""
+    single_visible = f"{_OCR_TITLE}\n{_OCR_RULE}\n{text}\n{_OCR_RULE}\n{_OCR_FOOTER}"
+    if _tt.fits(single_visible):
+        return [_ocr_single_html(text)]
+    chunks = _tt.split_text(text, _tt.chunk_room(_OCR_CHUNK_OVERHEAD))
+    shown = chunks[:_OCR_MAX_MESSAGES]
+    omitted = len(text) - sum(len(c) for c in shown)
+    total = len(shown)
+    messages = []
+    for index, chunk in enumerate(shown, start=1):
+        body = (
+            f"📝 <b>OCR Extracted Result (part {index} of {total}):</b>\n"
+            f"{_OCR_RULE}\n"
+            f"<code>{_html.escape(chunk)}</code>\n"
+            f"{_OCR_RULE}\n"
+            f"<i>{_OCR_FOOTER}</i>"
+        )
+        if index == total and omitted > 0:
+            body += f"\n⚠️ Output truncated: {omitted} more characters not shown."
+        messages.append(body)
+    return messages
 
 
 @router.message(Command("ocr"))
@@ -43,25 +92,34 @@ async def cmd_ocr(
         return
 
     status = await message.reply("📝 Processing Image OCR...")
-    photo = message.reply_to_message.photo[-1]
-    file_info = await bot.get_file(photo.file_id)
-    photo_bytes = await bot.download_file(file_info.file_path)
+    status_resolved = False
+    try:
+        photo = message.reply_to_message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        photo_bytes = await bot.download_file(file_info.file_path)
 
-    extracted_text = await ocr_service.extract_text(photo_bytes.read(), message.from_user.id)
+        extracted_text = await ocr_service.extract_text(photo_bytes.read(), message.from_user.id)
 
-    if extracted_text:
-        # OCR output can contain any character including backticks, asterisks, underscores
-        e_text = _html.escape(extracted_text)
-        res_text = (
-            f"📝 <b>OCR Extracted Result:</b>\n"
-            f"───────────────────────────\n"
-            f"<code>{e_text}</code>\n"
-            f"───────────────────────────\n"
-            f"<i>Tap text block to copy.</i>"
-        )
-        await status.edit_text(res_text, parse_mode="HTML")
-    else:
-        await status.edit_text("❌ No optical text detected in image payload.")
+        if extracted_text:
+            # OCR output can contain any character including backticks, asterisks,
+            # underscores: every chunk is html.escape()d inside <code>.
+            messages = _ocr_messages(extracted_text)
+            await status.edit_text(messages[0], parse_mode="HTML")
+            status_resolved = True
+            for part in messages[1:]:
+                await message.reply(part, parse_mode="HTML")
+        else:
+            await status.edit_text("❌ No optical text detected in image payload.")
+            status_resolved = True
+    except Exception:
+        # Do not leave the user on "Processing…". The original error is always
+        # re-raised so the error middleware keeps logging and replying as before.
+        if not status_resolved:
+            try:
+                await status.edit_text("❌ OCR failed. Please try again.")
+            except Exception as edit_exc:  # noqa: BLE001 - secondary failure; original re-raised below
+                logger.warning({"event": "ocr_status_update_failed", "error": type(edit_exc).__name__})
+        raise
 
 
 @router.message(Command("short"))
@@ -222,12 +280,21 @@ _QR_CAPTION_LIMIT = 900
 _QR_CAPTION_PREVIEW_CHARS = 200
 _QR_CAPTION_TITLE = "🔳 Generated QR Code Matrix:\n"
 
+# CHG-027 — dense-code hint. Decided on the actual QR version (module density),
+# not on input length: version v has 17 + 4v modules per side. Version 29 is
+# 133 modules per side. In an approximate screen-display simulation (image
+# shown ~480 px wide, light blur + JPEG) zbar first failed to decode at
+# version 29 (~3.4 px per module); below it decoding held. This is a
+# heuristic from a simulation, not a camera test. Typical lowercase text
+# reaches version 29 at about 1,200 characters (all-uppercase about 1,700).
+_QR_DENSE_VERSION = 29
+
 
 def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
-def _build_qr_caption(content: str) -> str:
+def _build_qr_caption(content: str, version: int | None = None) -> str:
     """HTML caption for the QR photo, always within Telegram's limit.
 
     Input that fits the budget keeps the original caption byte-for-byte.
@@ -235,15 +302,25 @@ def _build_qr_caption(content: str) -> str:
     notice; the QR image itself always carries the full text. Escaping is
     applied after truncation and truncation is by code point, so neither an
     HTML entity nor a character is ever cut in half.
+
+    When ``version`` (the QR version actually used) is at or above
+    ``_QR_DENSE_VERSION`` a short scanning hint is appended. It makes no claim
+    that the code was decoded or verified; an unknown version adds nothing.
     """
-    if _utf16_len(_QR_CAPTION_TITLE) + _utf16_len(content) <= _QR_CAPTION_LIMIT:
-        return f"🔳 <b>Generated QR Code Matrix:</b>\n<code>{_html.escape(content)}</code>"
+    warning = ""
+    if version is not None and version >= _QR_DENSE_VERSION:
+        warning = (
+            f"\n⚠️ Dense QR code (version {version}): it may be hard to scan "
+            "from a screen. Zoom in or use a dedicated scanner."
+        )
+    if _utf16_len(_QR_CAPTION_TITLE) + _utf16_len(content) + _utf16_len(warning) <= _QR_CAPTION_LIMIT:
+        return f"🔳 <b>Generated QR Code Matrix:</b>\n<code>{_html.escape(content)}</code>{warning}"
     preview = content[:_QR_CAPTION_PREVIEW_CHARS]
     return (
         "🔳 <b>Generated QR Code Matrix:</b>\n"
         f"<code>{_html.escape(preview)}</code>…\n"
         f"ℹ️ Input truncated: showing the first {len(preview)} of {len(content)} "
-        "characters. The QR code contains the full text."
+        f"characters. The QR code contains the full text.{warning}"
     )
 
 
@@ -258,11 +335,15 @@ async def cmd_qr(message: Message) -> None:
         return
     content = args[1]
     try:
-        bio = qr.generate_qr_buffer(content)
+        bio, qr_version = qr.generate_qr_with_version(content)
     except QRDataOverflowError:
+        # Capacity depends on the content's encoding mode (digits, uppercase
+        # alphanumeric, or bytes) and on error correction, so no fixed limit
+        # is promised here.
         await message.reply(
             "❌ <b>Data too large for QR code.</b>\n"
-            "QR codes support up to ~2,900 bytes. Please shorten the text and try again.",
+            "Capacity depends on the text and its encoding. "
+            "Please shorten the input and try again.",
             parse_mode="HTML",
         )
         return
@@ -272,7 +353,7 @@ async def cmd_qr(message: Message) -> None:
         # escaped and length-limited by _build_qr_caption (CHG-026).
         await message.reply_photo(
             photo=input_file,
-            caption=_build_qr_caption(content),
+            caption=_build_qr_caption(content, qr_version),
             parse_mode="HTML",
         )
     finally:

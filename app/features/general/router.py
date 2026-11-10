@@ -9,6 +9,7 @@ from aiogram.filters import CommandStart, Command
 from app.platform.capability import FeatureManifest
 from app.keyboards.inline_kb import main_menu_kb, category_dev_kb
 from app.utils import crypto
+from app.utils import telegram_text as _tt
 from app.utils.network import is_safe_host as _is_safe_host
 from app.core.logger import setup_logger
 
@@ -289,6 +290,10 @@ async def cmd_urlen(message: Message) -> None:
         await message.reply("❌ **Usage:** `/urlen <text>`", parse_mode="Markdown")
         return
     encoded = crypto.url_encode(args[1])
+    # CHG-028: never send (or truncate) a result Telegram would reject.
+    if not _tt.fits(f"🔗 URL Encoded Payload:\n{encoded}"):
+        await message.reply(_tt.too_long_notice("URL-encoded"), parse_mode="HTML")
+        return
     await message.reply(f"🔗 **URL Encoded Payload:**\n`{encoded}`", parse_mode="Markdown")
 
 
@@ -364,12 +369,25 @@ async def cmd_jsonfmt(message: Message) -> None:
     if len(args) < 2:
         await message.reply("❌ **Usage:** `/jsonfmt <json_string>`", parse_mode="Markdown")
         return
+    import html as _html
+    # CHG-028: only parsing/formatting problems mean "invalid JSON"; a failing
+    # send must not be mislabelled. ValueError covers JSONDecodeError and the
+    # int-digit limit; RecursionError covers pathologically nested input.
     try:
         parsed = json.loads(args[1])
         formatted = json.dumps(parsed, indent=4)
-        await message.reply(f"📋 **Pretty JSON Output:**\n```json\n{formatted}\n```", parse_mode="Markdown")
-    except Exception as exc:
+    except (ValueError, RecursionError) as exc:
         await message.reply(f"❌ **Invalid JSON:** `{exc}`", parse_mode="Markdown")
+        return
+    if not _tt.fits(f"📋 Pretty JSON Output:\n{formatted}"):
+        await message.reply(_tt.too_long_notice("formatted JSON"), parse_mode="HTML")
+        return
+    # HTML <pre> with escaped content: backticks and backslashes in JSON strings
+    # are safe here, unlike inside a legacy-Markdown code block.
+    await message.reply(
+        f'📋 <b>Pretty JSON Output:</b>\n<pre><code class="language-json">{_html.escape(formatted)}</code></pre>',
+        parse_mode="HTML",
+    )
 
 
 

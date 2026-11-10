@@ -4,6 +4,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 from app.platform.capability import FeatureManifest
 from app.utils import crypto
+from app.utils import telegram_text as _tt
 
 manifest = FeatureManifest(name="CryptoTools", version="1.0.0", category="Utility")
 router = Router()
@@ -76,7 +77,12 @@ async def cmd_b64en(message: Message):
     if len(args) < 2:
         await message.reply("❌ **Usage:** `/b64en <text>`", parse_mode="Markdown")
         return
-    await message.reply(f"🔢 **Base64 Encoded:**\n`{crypto.b64_encode(args[1])}`", parse_mode="Markdown")
+    encoded = crypto.b64_encode(args[1])
+    # CHG-028: never send (or truncate) a result Telegram would reject.
+    if not _tt.fits(f"🔢 Base64 Encoded:\n{encoded}"):
+        await message.reply(_tt.too_long_notice("Base64"), parse_mode="HTML")
+        return
+    await message.reply(f"🔢 **Base64 Encoded:**\n`{encoded}`", parse_mode="Markdown")
 
 @router.message(Command("b64de"))
 async def cmd_b64de(message: Message):
@@ -84,14 +90,20 @@ async def cmd_b64de(message: Message):
     if len(args) < 2:
         await message.reply("❌ <b>Usage:</b> <code>/b64de &lt;string&gt;</code>", parse_mode="HTML")
         return
+    # CHG-028: only decoding problems (binascii.Error / UnicodeError, both
+    # ValueError) mean "invalid Base64"; a failing send must not be mislabelled.
     try:
         decoded = crypto.b64_decode(args[1])
-        await message.reply(
-            f"🔡 <b>Base64 Decoded:</b>\n<code>{_html.escape(decoded)}</code>",
-            parse_mode="HTML",
-        )
-    except Exception:
+    except ValueError:
         await message.reply("❌ <b>Error:</b> Invalid Base64 string payload.", parse_mode="HTML")
+        return
+    if not _tt.fits(f"🔡 Base64 Decoded:\n{decoded}"):
+        await message.reply(_tt.too_long_notice("decoded"), parse_mode="HTML")
+        return
+    await message.reply(
+        f"🔡 <b>Base64 Decoded:</b>\n<code>{_html.escape(decoded)}</code>",
+        parse_mode="HTML",
+    )
 
 @router.message(Command("time"))
 async def cmd_time(message: Message):

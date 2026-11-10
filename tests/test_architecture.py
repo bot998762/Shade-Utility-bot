@@ -609,12 +609,16 @@ class TestQRDataOverflowHandling(unittest.TestCase):
         )
 
     def test_valid_path_still_uses_generate_qr_buffer(self):
-        """The successful code path must still call qr.generate_qr_buffer()."""
+        """The successful path must still generate through app.utils.qr.
+
+        CHG-027: cmd_qr now calls qr.generate_qr_with_version(content), which
+        wraps the unchanged generate_qr_buffer() and also returns the QR version.
+        """
         cmd_src = self._get_cmd_qr_src()
         self.assertIn(
-            "qr.generate_qr_buffer(content)",
+            "qr.generate_qr_with_version(content)",
             cmd_src,
-            "Valid path must still call qr.generate_qr_buffer(content)",
+            "Valid path must call qr.generate_qr_with_version(content)",
         )
 
     def test_finally_block_still_closes_bio(self):

@@ -14,12 +14,17 @@
 | `tests/test_phase2c_2k.py` | 128 | 128 | 0 | 0 | Phase 2C–2K features and architecture invariants |
 | `tests/test_session_manager.py` | 60 | 37 | 0 | 23 | Session manager flows |
 | `tests/test_short_expand_ssrf.py` | 74 | 67 | 0 | 7 | `/short expand` SSRF hardening (CHG-024) |
-| `tests/test_qr_caption.py` | 15 | 13 | 0 | 2 | `/qr` caption length/escaping (CHG-026) |
-| **TOTAL** | **685** | **514** | **0** | **171** | 136 subtests also passed |
+| `tests/test_telegram_text.py` | 51 | 51 | 0 | 0 | Message-length safety helper and handlers (CHG-028) |
+| `tests/test_qr_caption.py` | 30 | 20 | 0 | 10 | `/qr` caption length/escaping (CHG-026), capacity message and dense-code hint (CHG-027) |
+| **TOTAL** | **751** | **572** | **0** | **179** | 136 subtests also passed |
 
-Command: `/root/.local/bin/pytest tests/ -q` → `514 passed, 171 skipped, 136 subtests passed`.
+Command: `/root/.local/bin/pytest tests/ -q` → `572 passed, 179 skipped, 136 subtests passed`.
 
-**CHG-026:** new `tests/test_qr_caption.py` (15 collected: 13 run everywhere against a fake message/QR module, 2 need the real qrcode library). With real qrcode 7.4.2 and aiohttp 3.9.1 the full suite is 542 passed, 143 skipped, 0 failed. `test_markdown_safety.py::test_qr_input_escaped` was updated because caption escaping moved into `_build_qr_caption`.
+**CHG-026:** new `tests/test_qr_caption.py` (15 collected: 13 run everywhere against a fake message/QR module, 2 need the real qrcode library). With real qrcode 7.4.2 and aiohttp 3.9.1 the full suite is 608 passed, 143 skipped, 0 failed. `test_markdown_safety.py::test_qr_input_escaped` was updated because caption escaping moved into `_build_qr_caption`.
+
+**CHG-028:** new `tests/test_telegram_text.py` (51 tests, no optional dependencies, so all run in every environment): the helper (UTF-16 length, newline-aware lossless splitting, emoji, property test) and the real handler source of `/ocr`, `/b64en`, `/b64de`, `/urlen`, `/jsonfmt` run against fake messages. `test_markdown_safety.py::test_ocr_output_escaped` now checks the new OCR message builders. With real qrcode/aiohttp sources: 608 passed, 143 skipped, 0 failed.
+
+**CHG-027:** `test_qr_caption.py` grew from 15 to 30 collected tests (10 need the real qrcode library and skip without it); `test_architecture.py::test_valid_path_still_uses_generate_qr_buffer` now expects `qr.generate_qr_with_version(content)`.
 
 **CHG-025:** +7 handler-message tests in `test_short_expand_ssrf.py` (`TestExpandResultMessages`); they need no optional dependencies, so all 7 pass in the default sandbox. With real qrcode 7.4.2 and aiohttp 3.9.1 the full suite is 527 passed, 143 skipped, 0 failed.
 
@@ -27,7 +32,7 @@ Command: `/root/.local/bin/pytest tests/ -q` → `514 passed, 171 skipped, 136 s
 
 **Correction (CHG-024):** earlier versions of this table listed 433 total / 286 pass / 147 skip. That was wrong: it omitted `test_phase2c_2k.py` (128 tests) and listed `test_architecture.py` as 46 tests when it collects 77. The table above is taken from actual collection and per-file runs. Before CHG-024 the full suite was 434 passed / 158 skipped (592 collected); CHG-024 added 67 collected tests (60 pass, 7 skip).
 
-**Skipped tests are NOT passes.** Skip reasons in the current environment (`pytest -rs`): telethon not installed 86; aiogram not installed 32; deep_translator not installed 19; aiohttp not installed 21; pydantic_settings not installed 4; qrcode not installed 7; prometheus_client or other dependency not installed 2. Earlier notes attributing the behavioral skips to aiohttp alone were inaccurate.
+**Skipped tests are NOT passes.** Skip reasons in the current environment (`pytest -rs`): telethon not installed 86; aiogram not installed 32; deep_translator not installed 19; aiohttp not installed 21; pydantic_settings not installed 4; qrcode not installed 15; prometheus_client or other dependency not installed 2. Earlier notes attributing the behavioral skips to aiohttp alone were inaccurate.
 
 **Dead tests:** the 19 `deep_translator` skips can never run as written: `deep-translator` was removed from `requirements.txt` in CHG-021 and nothing in `app/` imports it.
 
