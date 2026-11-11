@@ -809,6 +809,19 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### CHG-029 — `/short expand` Reply Length Guard
+**Date:** 2026-11-11
+**Type:** Reliability fix (source-supported; live behaviour not reverified)
+**Problem:** A redirect chain of long URLs (each hop may be up to `MAX_URL_LENGTH` = 2,048 characters, up to 6 hops) could make the `/short expand` reply exceed Telegram's 4,096-character limit, so the final edit was rejected and the user was left on "Tracing…" with a generic error. Six 2,000-character hops produce roughly 12,000 characters.
+**Change:** `app/features/media/router.py` only. The reply is built by `_expand_full_text` (the previous text, unchanged). If its visible size (via the existing `telegram_text` helpers) is within `SINGLE_MESSAGE_BUDGET` (4,000 UTF-16 units) it is sent byte-for-byte as before. Otherwise `_expansion_text` builds a compact reply: header "…, long URLs shortened"; every hop that fits stays complete; shortened hops are shown as an escaped prefix followed by "… (shortened: first X of Y characters — incomplete)"; the final destination is kept complete whenever it fits and, if it cannot, is labelled "Final destination (shortened)" (or "Last URL reached (shortened)" for a stopped chain); a footer states that URLs marked "shortened" are incomplete prefixes, not usable links. Room is allocated final-URL-first, then shared across hops so short hops stay whole. Prefixes use `telegram_text.split_text`, escaping happens after truncation, and a shrink loop enforces the measured budget. `edit_text` of the result is wrapped: on failure the status is replaced by "❌ Could not display the expansion result. Please try again.", a secondary failure is swallowed (type name logged), and the original exception is re-raised.
+**Files changed:** `app/features/media/router.py`, `tests/test_short_expand_ssrf.py`, `TESTING.md`, `PROJECT_CONTEXT.md`
+**Files NOT changed:** `session/router.py` (frozen), `middlewares/error.py`/`di.py`, `bootstrap.py`, `safe_url.py` (including `GuardedResolver`), `network.py`, `telegram_text.py`, `qr.py`, `/tr`, other handlers; network behaviour, SSRF protections, redirect validation, DNS, timeouts, hop and URL limits are unchanged.
+**Tests:** 21 new (see TESTING.md). Negative controls: disabling the compact path (11 tests fail) and removing the re-raise (2 tests fail).
+**Known limitations:** No live Telegram verification. A shortened URL is a display prefix, not a usable link, and the user must repeat `/short expand` or open the link themselves to see more. A final URL longer than the budget (possible only through a relative `Location` joined past 2,048 characters) is shown shortened and labelled. The 7 aiohttp SSRF tests skip in the default sandbox.
+**Status:** COMPLETE locally; live retest pending
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -928,6 +941,9 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ### CHG-028 Verification
 - Default sandbox: 572 passed, 179 skipped, 0 failed. Real qrcode 7.4.2 + aiohttp 3.9.1 sources: 608 passed, 143 skipped, 0 failed; SSRF file 74 passed. Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d`; all protected files byte-identical to the CHG-027 baseline. Live Telegram behaviour not verified.
+
+### CHG-029 Verification
+- Baseline CHG-028 ZIP SHA-256 `3a1bd41ed7bb4220a1b06a02a65ecd290cac147b36df5e740bb31070845bda2b` verified before work. Default sandbox: 593 passed, 179 skipped, 0 failed (136 subtests passed); `test_short_expand_ssrf.py` 88 passed, 7 skipped. Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d`; all protected files byte-identical to the CHG-028 baseline. Ruff on changed files: no new findings. Live Telegram behaviour not verified.
 
 ## 12. KNOWN ISSUES
 

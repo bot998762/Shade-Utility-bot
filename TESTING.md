@@ -13,14 +13,16 @@
 | `tests/test_markdown_safety.py` | 46 | 25 | 0 | 21 | Parse mode / escaping |
 | `tests/test_phase2c_2k.py` | 128 | 128 | 0 | 0 | Phase 2C–2K features and architecture invariants |
 | `tests/test_session_manager.py` | 60 | 37 | 0 | 23 | Session manager flows |
-| `tests/test_short_expand_ssrf.py` | 74 | 67 | 0 | 7 | `/short expand` SSRF hardening (CHG-024) |
+| `tests/test_short_expand_ssrf.py` | 95 | 88 | 0 | 7 | `/short expand` SSRF hardening (CHG-024), reply wording (CHG-025), reply length guard (CHG-029) |
 | `tests/test_telegram_text.py` | 51 | 51 | 0 | 0 | Message-length safety helper and handlers (CHG-028) |
 | `tests/test_qr_caption.py` | 30 | 20 | 0 | 10 | `/qr` caption length/escaping (CHG-026), capacity message and dense-code hint (CHG-027) |
-| **TOTAL** | **751** | **572** | **0** | **179** | 136 subtests also passed |
+| **TOTAL** | **772** | **593** | **0** | **179** | 136 subtests also passed |
 
-Command: `/root/.local/bin/pytest tests/ -q` → `572 passed, 179 skipped, 136 subtests passed`.
+Command: `/root/.local/bin/pytest tests/ -q` → `593 passed, 179 skipped, 136 subtests passed`.
 
 **CHG-026:** new `tests/test_qr_caption.py` (15 collected: 13 run everywhere against a fake message/QR module, 2 need the real qrcode library). With real qrcode 7.4.2 and aiohttp 3.9.1 the full suite is 608 passed, 143 skipped, 0 failed. `test_markdown_safety.py::test_qr_input_escaped` was updated because caption escaping moved into `_build_qr_caption`.
+
+**CHG-029:** 21 new tests in `tests/test_short_expand_ssrf.py` (`TestExpandLengthGuard`, no optional dependencies, so all run in every environment): normal, no-redirect and truncated-chain replies byte-for-byte unchanged; 4×700 and 6×2,000-character chains; maximum-length (2,048) URLs; a final URL beyond the maximum; shortened/incomplete labelling; the final destination complete whenever it fits; the budget boundary just inside and outside; escaping of `< > & " '` after truncation (no cut entity, balanced tags); emoji (no split surrogate pairs) and non-ASCII URLs; `edit_text` failure replaces the status and re-raises the original exception; a secondary failure is swallowed; loop/timeout/blocked/network messages unchanged and distinct. Sizes are measured by parsing the HTML (UTF-16). The harness extracts the new router helpers by AST (9 nodes). The 7 aiohttp-dependent SSRF tests still skip in the default sandbox; the 67 CHG-024 SSRF tests are unchanged.
 
 **CHG-028:** new `tests/test_telegram_text.py` (51 tests, no optional dependencies, so all run in every environment): the helper (UTF-16 length, newline-aware lossless splitting, emoji, property test) and the real handler source of `/ocr`, `/b64en`, `/b64de`, `/urlen`, `/jsonfmt` run against fake messages. `test_markdown_safety.py::test_ocr_output_escaped` now checks the new OCR message builders. With real qrcode/aiohttp sources: 608 passed, 143 skipped, 0 failed.
 

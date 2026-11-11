@@ -167,6 +167,152 @@ _EXPAND_URL_ERRORS = {
 _MAX_REDIRECTS = _su.MAX_REDIRECTS
 
 
+# CHG-029 — /short expand replies must stay within Telegram's message size.
+# A chain of long tracking URLs can exceed it (each hop may be up to
+# safe_url.MAX_URL_LENGTH characters). Replies that fit are built exactly as
+# before; only oversized ones use the compact form below, in which every
+# shortened URL is an explicitly labelled, incomplete prefix.
+_EXPAND_MARKER_RESERVE = 70   # worst-case visible text of one "(shortened: …)" label
+_EXPAND_MIN_HOP_UNITS = 40    # smallest prefix worth showing for an intermediate hop
+
+
+def _expand_full_text(hops: list[str], truncated: bool) -> str:
+    """The standard expansion reply (unchanged since CHG-025)."""
+    import html as _html
+
+    final = hops[-1]
+    hop_count = len(hops) - 1
+    e_final = _html.escape(final)
+    if hop_count == 0 and not truncated:
+        # No HTTP redirect (3xx + Location) was seen. That does NOT prove the
+        # URL is the real destination: some shorteners (e.g. v.gd) answer with
+        # a landing/preview page that only shows the target as a clickable link.
+        return (
+            "🔗 <b>URL Expansion:</b>\n"
+            "No HTTP redirect was detected for:\n"
+            f"<code>{e_final}</code>\n"
+            "ℹ️ This may be a landing or preview page, so the actual destination may differ."
+        )
+    hop_lines = "\n".join(f"  {i+1}. <code>{_html.escape(h)}</code>" for i, h in enumerate(hops))
+    text = (
+        f"🔗 <b>URL Expansion ({hop_count} redirect{'s' if hop_count != 1 else ''}):</b>\n"
+        f"{hop_lines}\n"
+        f"───────────────────────────\n"
+    )
+    if truncated:
+        text += f"⚠️ Stopped after {_MAX_REDIRECTS} redirects — the chain continues.\n<b>Last URL reached:</b> <code>{e_final}</code>"
+    else:
+        text += f"✅ <b>Final destination:</b> <code>{e_final}</code>"
+    return text
+
+
+def _expand_prefix(url: str, max_units: int) -> str:
+    """Longest prefix of ``url`` within ``max_units`` UTF-16 units (code-point safe)."""
+    chunks = _tt.split_text(url, max_units)
+    return chunks[0] if chunks else ""
+
+
+def _expand_shortened(url: str, max_units: int) -> tuple[str, str]:
+    """(escaped_code_html, label_html) for a URL shown within ``max_units``.
+
+    A URL that fits is returned complete with no label. Otherwise the result is
+    an escaped prefix followed by an explicit "shortened / incomplete" label.
+    Escaping happens after truncation, so no entity is ever cut.
+    """
+    import html as _html
+
+    if _tt.utf16_len(url) <= max_units:
+        return f"<code>{_html.escape(url)}</code>", ""
+    prefix = _expand_prefix(url, max_units)
+    return (
+        f"<code>{_html.escape(prefix)}</code>…",
+        f" <i>(shortened: first {len(prefix)} of {len(url)} characters — incomplete)</i>",
+    )
+
+
+def _expansion_text(hops: list[str], truncated: bool) -> str:
+    """HTML reply for a finished trace, always within the unsplit message budget."""
+    full = _expand_full_text(hops, truncated)
+    if _tt.fits(_tt.html_visible_text(full)):
+        return full
+
+    budget = _tt.SINGLE_MESSAGE_BUDGET
+    final = hops[-1]
+    hop_count = len(hops) - 1
+    head = (
+        f"🔗 <b>URL Expansion ({hop_count} redirect{'s' if hop_count != 1 else ''}, "
+        "long URLs shortened):</b>\n"
+    )
+    rule = "───────────────────────────\n"
+    if truncated:
+        final_label = f"⚠️ Stopped after {_MAX_REDIRECTS} redirects — the chain continues.\n<b>Last URL reached"
+    else:
+        final_label = "✅ <b>Final destination"
+    note = (
+        "\nℹ️ URLs marked “shortened” are incomplete prefixes, not usable links."
+    )
+    # Visible-text overhead of everything except the URLs and shortening labels.
+    skeleton = _tt.html_visible_len(
+        head + "".join(f"  {i+1}. \n" for i in range(len(hops))) + rule + final_label + " (shortened): " + note
+    )
+    reserve = _EXPAND_MARKER_RESERVE * (len(hops) + 1)
+    free = budget - skeleton - reserve
+
+    # The final destination keeps priority: complete whenever it fits.
+    final_room = max(free - _EXPAND_MIN_HOP_UNITS * len(hops), _EXPAND_MIN_HOP_UNITS)
+    final_units = min(_tt.utf16_len(final), final_room)
+    hop_room = max(free - final_units, 0)
+
+    # Share the remaining room: short hops stay complete and free their
+    # unused share for longer ones (water-filling).
+    units = [_tt.utf16_len(h) for h in hops]
+    allowance = [0] * len(hops)
+    pending = list(range(len(hops)))
+    remaining = hop_room
+    while pending:
+        share = remaining // len(pending)
+        fits_now = [i for i in pending if units[i] <= share]
+        if not fits_now:
+            for i in pending:
+                allowance[i] = max(share, _EXPAND_MIN_HOP_UNITS)
+            break
+        for i in fits_now:
+            allowance[i] = units[i]
+            remaining -= units[i]
+            pending.remove(i)
+
+    def build(final_cap: int, caps: list[int]) -> tuple[str, bool]:
+        lines, any_short = [], False
+        for i, h in enumerate(hops):
+            code, label = _expand_shortened(h, caps[i])
+            any_short = any_short or bool(label)
+            lines.append(f"  {i+1}. {code}{label}")
+        f_code, f_label = _expand_shortened(final, final_cap)
+        any_short = any_short or bool(f_label)
+        shortened_final = " (shortened)" if f_label else ""
+        text = (
+            head + "\n".join(lines) + "\n" + rule
+            + f"{final_label}{shortened_final}:</b> {f_code}{f_label}"
+        )
+        if any_short:
+            text += note
+        return text, any_short
+
+    # Defensive loop: the allocation above targets the budget; tighten until the
+    # measured visible size really fits (it normally succeeds on the first pass).
+    caps = allowance[:]
+    final_cap = final_units
+    for _ in range(8):
+        text, _short = build(final_cap, caps)
+        over = _tt.html_visible_len(text) - budget
+        if over <= 0:
+            return text
+        caps = [max(c - (over // len(hops) + 8), _EXPAND_MIN_HOP_UNITS) for c in caps]
+        if all(c == _EXPAND_MIN_HOP_UNITS for c in caps):
+            final_cap = max(final_cap - over - 8, _EXPAND_MIN_HOP_UNITS)
+    return text
+
+
 async def _cmd_short_expand(message, raw_url: str, bootstrap_ref=None) -> None:
     """
     CHG-024 — SSRF-hardened URL expansion.
@@ -226,32 +372,16 @@ async def _cmd_short_expand(message, raw_url: str, bootstrap_ref=None) -> None:
         await status.edit_text(text, parse_mode="HTML")
         return
 
-    hops = result.hops
-    final = hops[-1]
-    hop_count = len(hops) - 1
-    e_final = _html.escape(final)
-    if hop_count == 0 and not result.truncated:
-        # No HTTP redirect (3xx + Location) was seen. That does NOT prove the
-        # URL is the real destination: some shorteners (e.g. v.gd) answer with
-        # a landing/preview page that only shows the target as a clickable link.
-        text = (
-            "🔗 <b>URL Expansion:</b>\n"
-            "No HTTP redirect was detected for:\n"
-            f"<code>{e_final}</code>\n"
-            "ℹ️ This may be a landing or preview page, so the actual destination may differ."
-        )
-    else:
-        hop_lines = "\n".join(f"  {i+1}. <code>{_html.escape(h)}</code>" for i, h in enumerate(hops))
-        text = (
-            f"🔗 <b>URL Expansion ({hop_count} redirect{'s' if hop_count != 1 else ''}):</b>\n"
-            f"{hop_lines}\n"
-            f"───────────────────────────\n"
-        )
-        if result.truncated:
-            text += f"⚠️ Stopped after {_MAX_REDIRECTS} redirects — the chain continues.\n<b>Last URL reached:</b> <code>{e_final}</code>"
-        else:
-            text += f"✅ <b>Final destination:</b> <code>{e_final}</code>"
-    await status.edit_text(text, parse_mode="HTML")
+    try:
+        await status.edit_text(_expansion_text(result.hops, result.truncated), parse_mode="HTML")
+    except Exception:
+        # CHG-029: do not leave the user on "Tracing…". The original error is
+        # always re-raised so the error middleware keeps logging and replying.
+        try:
+            await status.edit_text("❌ Could not display the expansion result. Please try again.")
+        except Exception as edit_exc:  # noqa: BLE001 - secondary failure; original re-raised below
+            logger.warning({"event": "short_expand_status_update_failed", "error": type(edit_exc).__name__})
+        raise
 
 
 @router.message(Command("tr"))

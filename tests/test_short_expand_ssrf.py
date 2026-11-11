@@ -658,19 +658,26 @@ class TestExpandResultMessages(unittest.IsolatedAsyncioTestCase):
         src = (PROJECT_ROOT / "app/features/media/router.py").read_text()
         tree = ast.parse(src)
         wanted = []
+        names = {
+            "_cmd_short_expand", "_expand_full_text", "_expand_prefix", "_expand_shortened",
+            "_expansion_text", "_EXPAND_URL_ERRORS", "_MAX_REDIRECTS",
+            "_EXPAND_MARKER_RESERVE", "_EXPAND_MIN_HOP_UNITS",
+        }
         for n in tree.body:
-            if isinstance(n, ast.AsyncFunctionDef) and n.name == "_cmd_short_expand":
+            if isinstance(n, ast.Assign):
+                declared = {getattr(t, "id", "") for t in n.targets}
+            else:
+                declared = {getattr(n, "name", "")}
+            if declared & names:
                 wanted.append(n)
-            elif isinstance(n, ast.Assign) and any(
-                getattr(t, "id", "") in ("_EXPAND_URL_ERRORS", "_MAX_REDIRECTS") for t in n.targets
-            ):
-                wanted.append(n)
-        self.assertEqual(len(wanted), 3)
+        self.assertEqual(len(wanted), 9)
         fake_su = types.SimpleNamespace(**{k: getattr(su, k) for k in dir(su) if not k.startswith("__")})
         fake_su.trace_redirects = trace
         quiet = types.SimpleNamespace(warning=lambda *a, **k: None)
-        ns = {"_su": fake_su, "logger": quiet}
-        exec(compile(ast.Module(body=wanted, type_ignores=[]), "router_extract", "exec"), ns)
+        from app.utils import telegram_text as tt
+        ns = {"_su": fake_su, "_tt": tt, "logger": quiet}
+        exec(compile(ast.Module(body=wanted, type_ignores=[]), "router_extract", "exec"), ns)  # noqa: S102
+        self._ns = ns
         return ns["_cmd_short_expand"]
 
     async def _run(self, trace, url=None):
@@ -767,6 +774,264 @@ class TestExpandResultMessages(unittest.IsolatedAsyncioTestCase):
         await self._handler(trace)(Msg(), "http://127.0.0.1/", Boot())
         self.assertEqual(calls, [])
         self.assertEqual(replies, ["❌ Private/reserved host in URL — cannot expand."])
+
+
+class TestExpandLengthGuard(unittest.IsolatedAsyncioTestCase):
+    """CHG-029 — /short expand replies must fit Telegram's message limit.
+
+    Same extraction harness as TestExpandResultMessages: no aiogram, no network.
+    Sizes are measured with the shared telegram_text helpers (HTML parsed, UTF-16).
+    """
+
+    def setUp(self):
+        from app.utils import telegram_text as tt
+        self.tt = tt
+        helper = TestExpandResultMessages()
+        helper._handler(None)
+        self.ns = helper._ns
+        self.build = self.ns["_expansion_text"]
+
+    def vis(self, text):
+        return self.tt.html_visible_len(text)
+
+    @staticmethod
+    def _url(n, ch="a", host="https://t.example/"):
+        return host + ch * (n - len(host))
+
+    def _assert_fits(self, text):
+        self.assertLessEqual(self.vis(text), self.tt.SINGLE_MESSAGE_BUDGET)
+        self.assertLess(self.vis(text), self.tt.TELEGRAM_MESSAGE_LIMIT)
+
+    # --- unchanged outputs ------------------------------------------------
+    def test_normal_chain_byte_for_byte(self):
+        text = self.build(["https://a.test/x", "https://b.test/y?q=1&r=2"], False)
+        self.assertEqual(
+            text,
+            "🔗 <b>URL Expansion (1 redirect):</b>\n"
+            "  1. <code>https://a.test/x</code>\n"
+            "  2. <code>https://b.test/y?q=1&amp;r=2</code>\n"
+            "───────────────────────────\n"
+            "✅ <b>Final destination:</b> <code>https://b.test/y?q=1&amp;r=2</code>",
+        )
+
+    def test_no_redirect_byte_for_byte(self):
+        self.assertEqual(
+            self.build(["https://v.gd/UUSMmS"], False),
+            "🔗 <b>URL Expansion:</b>\n"
+            "No HTTP redirect was detected for:\n"
+            "<code>https://v.gd/UUSMmS</code>\n"
+            "ℹ️ This may be a landing or preview page, so the actual destination may differ.",
+        )
+
+    def test_truncated_chain_byte_for_byte(self):
+        hops = [f"https://h{i}.test/" for i in range(6)]
+        text = self.build(hops, True)
+        self.assertTrue(text.startswith("🔗 <b>URL Expansion (5 redirects):</b>\n"))
+        self.assertIn("⚠️ Stopped after 5 redirects — the chain continues.\n"
+                      "<b>Last URL reached:</b> <code>https://h5.test/</code>", text)
+        self.assertNotIn("shortened", text)
+
+    def test_single_redirect_uses_singular(self):
+        self.assertIn("(1 redirect):", self.build(["https://a.test/", "https://b.test/"], False))
+
+    # --- oversized chains -------------------------------------------------
+    def test_four_700_char_hops_fit_and_stay_complete(self):
+        # 4 x 700 + header is ~2,900 units: still under budget, so unchanged.
+        hops = [self._url(700, c) for c in "abcd"]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        self.assertNotIn("shortened", text)
+        for h in hops:
+            self.assertIn(h, text)
+
+    def test_six_2000_char_hops_fit_with_complete_final(self):
+        hops = [self._url(2000, c) for c in "abcdef"]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        self.assertIn(f"<b>Final destination:</b> <code>{hops[-1]}</code>", text)
+        self.assertIn("long URLs shortened", text)
+        self.assertIn("shortened", text)
+        self.assertNotIn("(shortened):", text.split("Final destination")[1])
+
+    def test_intermediate_hops_are_labelled_incomplete_prefixes(self):
+        hops = [self._url(2000, c) for c in "abcdef"]
+        text = self.build(hops, False)
+        lines = [ln for ln in text.split("\n") if ln.startswith("  ")]
+        self.assertEqual(len(lines), 6)
+        short = [ln for ln in lines[:-1] if "(shortened:" in ln]
+        self.assertTrue(short, "oversized intermediate hops must be labelled")
+        for ln in short:
+            self.assertIn("incomplete", ln)
+            self.assertIn("of 2000 characters", ln)
+        self.assertIn("incomplete prefixes, not usable links", text)
+
+    def test_truncated_chain_oversized_still_fits_and_keeps_wording(self):
+        hops = [self._url(2000, c) for c in "abcdef"]
+        text = self.build(hops, True)
+        self._assert_fits(text)
+        self.assertIn("Stopped after 5 redirects", text)
+        self.assertIn("<b>Last URL reached", text)
+        self.assertNotIn("Final destination", text)
+
+    def test_final_at_max_length_is_complete_when_it_fits(self):
+        hops = [self._url(2000, "a"), self._url(2000, "b"), self._url(su.MAX_URL_LENGTH, "z")]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        self.assertIn(f"<code>{hops[-1]}</code>", text.split("Final destination")[1])
+
+    def test_all_hops_max_length_fit(self):
+        hops = [self._url(su.MAX_URL_LENGTH, c) for c in "abcdef"]
+        for truncated in (False, True):
+            self._assert_fits(self.build(hops, truncated))
+
+    def test_final_is_labelled_when_it_must_be_shortened(self):
+        # A final URL (relative Location joined by urljoin) beyond 2048 can occur.
+        hops = [self._url(2048, "a"), self._url(9000, "z")]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        tail = text.split("Final destination")[1]
+        self.assertTrue(tail.startswith(" (shortened):"))
+        self.assertIn("of 9000 characters — incomplete", tail)
+        self.assertNotIn(hops[-1], text)
+
+    def test_never_presents_truncated_hop_as_complete(self):
+        hops = [self._url(2000, c) for c in "abcdef"]
+        text = self.build(hops, False)
+        for h in hops[:-1]:
+            for ln in text.split("\n"):
+                if f"<code>{h[:50]}" in ln and f"<code>{h}</code>" not in ln:
+                    self.assertIn("(shortened:", ln)
+                    self.assertIn("</code>…", ln)
+
+    # --- boundary ---------------------------------------------------------
+    def test_budget_boundary_inside_and_outside(self):
+        budget = self.tt.SINGLE_MESSAGE_BUDGET
+        base = ["https://a.test/", ""]
+        overhead = self.vis(self.ns["_expand_full_text"]([base[0], "https://b.test/"], False)) - len("https://b.test/") * 2 - len(base[0]) + len("https://b.test/") * 0
+        # Find the largest final URL for which the unchanged text still fits.
+        lo, hi = 20, 4000
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            t = self.ns["_expand_full_text"]([base[0], self._url(mid)], False)
+            if self.vis(t) <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        self.assertGreater(overhead, 0)
+        inside = self.build([base[0], self._url(lo)], False)
+        self.assertEqual(inside, self.ns["_expand_full_text"]([base[0], self._url(lo)], False))
+        self.assertEqual(self.vis(inside) <= budget, True)
+        outside = self.build([base[0], self._url(lo + 1)], False)
+        self.assertNotEqual(outside, self.ns["_expand_full_text"]([base[0], self._url(lo + 1)], False))
+        self._assert_fits(outside)
+
+    # --- escaping, Unicode ------------------------------------------------
+    def test_html_escaping_after_truncation_no_cut_entity(self):
+        nasty = "https://e.test/?" + "<>&\"'" * 600
+        hops = [nasty, nasty, nasty, nasty, nasty, self._url(100)]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        self.assertNotIn("<>", text)
+        import re
+        # every & starts a complete, known entity
+        for m in re.finditer(r"&[^;\s]*;?", text):
+            self.assertRegex(m.group(0), r"^&(amp|lt|gt|quot|#x27);$")
+        # tags stay balanced
+        self.assertEqual(text.count("<code>"), text.count("</code>"))
+        self.assertEqual(text.count("<i>"), text.count("</i>"))
+        self.assertEqual(text.count("<b>"), text.count("</b>"))
+
+    def test_emoji_not_split_in_surrogate_pairs(self):
+        emoji_url = "https://e.test/" + "😀" * 1000
+        hops = [emoji_url] * 5 + [self._url(60)]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        text.encode("utf-16-le")  # raises on a lone surrogate
+        self.assertNotIn("\ufffd", text)
+
+    def test_non_ascii_urls_fit(self):
+        hops = [f"https://例え.テスト/{c}" + "パス/" * 600 for c in "abcdef"]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        text.encode("utf-8")
+
+    def test_final_emoji_url_complete_when_it_fits(self):
+        final = "https://e.test/" + "😀" * 500
+        hops = [self._url(2000, "a"), self._url(2000, "b"), self._url(2000, "c"), final]
+        text = self.build(hops, False)
+        self._assert_fits(text)
+        self.assertIn(f"<code>{final}</code>", text)
+
+    def test_prefix_helper_uses_shared_splitter(self):
+        self.assertEqual(self.ns["_expand_prefix"]("abcdef", 3), "abc")
+        self.assertEqual(self.ns["_expand_prefix"]("😀😀", 2), "😀")
+
+    # --- failure handling -------------------------------------------------
+    async def _run_with_failing_edit(self, fail_times):
+        calls = []
+
+        class Boom(Exception):
+            pass
+
+        boom = Boom("original")
+
+        class Status:
+            async def edit_text(self_, text, **kw):
+                calls.append(text)
+                if len(calls) <= fail_times:
+                    raise boom if len(calls) == 1 else RuntimeError("secondary")
+
+        class Msg:
+            async def reply(self_, text, **kw):
+                return Status()
+
+        class Boot:
+            expand_session = type("S", (), {"closed": False})()
+
+        async def trace(session, target):
+            return su.TraceResult([target.url, "https://b.test/"], False)
+
+        handler = TestExpandResultMessages()._handler(trace)
+        with self.assertRaises(Boom) as ctx:
+            await handler(Msg(), "https://a.test/x", Boot())
+        self.assertIs(ctx.exception, boom)
+        return calls
+
+    async def test_edit_failure_replaces_status_and_reraises_original(self):
+        calls = await self._run_with_failing_edit(1)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("URL Expansion", calls[0])
+        self.assertEqual(calls[1], "❌ Could not display the expansion result. Please try again.")
+
+    async def test_secondary_edit_failure_is_swallowed_original_reraised(self):
+        calls = await self._run_with_failing_edit(2)
+        self.assertEqual(len(calls), 2)
+
+    async def test_other_outcome_messages_unchanged(self):
+        expected = {
+            "loop": "⛔ Redirect loop detected — expansion stopped.",
+            "timeout": "⏱️ The request timed out while tracing.",
+            "blocked": "⛔ Destination is not allowed — cannot expand.",
+            "error": "⏱️ Network error while tracing the URL.",
+        }
+        excs = {
+            "loop": su.RedirectLoopError("x"),
+            "timeout": asyncio.TimeoutError(),
+            "blocked": su.BlockedDestinationError("x"),
+            "error": RuntimeError("x"),
+        }
+        seen = {}
+        for key, exc in excs.items():
+            if exc is None:
+                continue
+            async def trace(session, target, _e=exc):
+                raise _e
+            seen[key] = await TestExpandResultMessages()._run(trace)
+        self.assertEqual(seen["loop"], expected["loop"])
+        self.assertEqual(seen["timeout"], expected["timeout"])
+        self.assertEqual(seen["blocked"], expected["blocked"])
+        self.assertEqual(seen["error"], expected["error"])
+        self.assertEqual(len(set(seen.values())), len(seen), "messages must stay distinct")
 
 
 if __name__ == "__main__":
