@@ -15,6 +15,7 @@ from urllib.parse import quote
 from app.core.config import settings
 from app.core.exceptions import ProviderAPIError
 from app.core.logger import setup_logger
+from app.utils.provider_diag import kind_for_status, safe_preview
 
 logger = setup_logger()
 
@@ -38,25 +39,37 @@ class CleanURIProvider:
                 logger.warning({
                     "event": "cleanuri_http_error",
                     "status": resp.status,
-                    "body_preview": raw[:150],
+                    "body_preview": safe_preview(raw),
                 })
-                raise ProviderAPIError(f"CleanURI HTTP {resp.status}")
+                raise ProviderAPIError(
+                    f"CleanURI HTTP {resp.status}",
+                    status=resp.status, kind=kind_for_status(resp.status),
+                )
 
             try:
                 data = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
                 logger.error({
                     "event": "cleanuri_non_json",
-                    "body_preview": raw[:150],
+                    "body_preview": safe_preview(raw),
                 })
-                raise ProviderAPIError("CleanURI returned non-JSON response")
+                raise ProviderAPIError(
+                    "CleanURI returned non-JSON response", status=resp.status, kind="bad_response",
+                )
 
             result = data.get("result_url", "")
             if result and result.startswith("http"):
                 return result
 
-            error_detail = data.get("error", raw[:100])
-            raise ProviderAPIError(f"CleanURI: {error_detail}")
+            # The provider's error text is not echoed into the exception (it may repeat
+            # the submitted URL); a sanitised preview goes to the log instead.
+            logger.warning({
+                "event": "cleanuri_error_response",
+                "body_preview": safe_preview(data.get("error", raw)),
+            })
+            raise ProviderAPIError(
+                "CleanURI returned an error response", status=resp.status, kind="bad_response",
+            )
 
 
 class VGdURLProvider:
@@ -77,13 +90,18 @@ class VGdURLProvider:
                 logger.warning({
                     "event": "vgd_http_error",
                     "status": resp.status,
-                    "body_preview": raw[:150],
+                    "body_preview": safe_preview(raw),
                 })
-                raise ProviderAPIError(f"v.gd HTTP {resp.status}")
+                raise ProviderAPIError(
+                    f"v.gd HTTP {resp.status}",
+                    status=resp.status, kind=kind_for_status(resp.status),
+                )
 
             stripped = raw.strip()
             if stripped.startswith("http"):
                 return stripped
 
-            logger.warning({"event": "vgd_unexpected_response", "body": raw[:150]})
-            raise ProviderAPIError(f"v.gd unexpected response: {raw[:80]}")
+            logger.warning({"event": "vgd_unexpected_response", "body_preview": safe_preview(raw)})
+            raise ProviderAPIError(
+                "v.gd unexpected response", status=resp.status, kind="bad_response",
+            )

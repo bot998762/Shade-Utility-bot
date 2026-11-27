@@ -822,6 +822,24 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ---
 
+### CHG-030 — `/short` Resilience: Consecutive-Failure Breaker, Cooldown/Outage Messages, Already-Shortened Check, Safe Diagnostics
+**Date:** 2026-11-16
+**Type:** Reliability fix (source- and mock-supported; live provider behaviour NOT verified)
+**Problem:** Live sequence: Pinterest URL shortened via v.gd, then `https://v.gd/Nlkqlc` and the same Pinterest URL both failed with the generic "Service is temporarily unavailable" (the error middleware's reply to `NoProvidersAvailableError`). Read-only audit findings: (1) `CircuitBreaker` only reset its failure counter in HALF_OPEN, so any two failures — however far apart, with successes between — opened a breaker for 60 s; (2) every provider refusal, rate limit or outage counted the same and produced the same message; (3) while both breakers were OPEN no provider was contacted at all. The root cause of the original provider failures (why CleanURI failed, whether v.gd refuses its own links) remains UNPROVEN; no server logs were available.
+**Change:**
+- **A** `app/core/circuit_breaker.py`: failures are counted consecutively — a success while CLOSED or HALF_OPEN resets the counter; a late success while OPEN does not close the breaker. Added `retry_after()`. HALF_OPEN behaviour unchanged. The breaker is shared with OCR (OCR regression tests added).
+- **C** `app/utils/short_links.py` (new, stdlib): `known_short_link_host()` — deliberately narrow (exact hosts v.gd, is.gd, cleanuri.com, optional `www.`, non-empty path). `/short` refuses such input before any provider call with a message pointing to `/short expand`. It does NOT claim to detect other shorteners.
+- **D** `app/core/exceptions.py`: `ProvidersCoolingDownError(NoProvidersAvailableError)` with `retry_after`; `ProviderAPIError` gained optional `status`/`kind`. `app/platform/failover.py` raises the cooldown subclass only when every provider was skipped by an OPEN breaker (no request made); otherwise the original `NoProvidersAvailableError`. `cmd_short` (`media/router.py`) now shows distinct messages: already-shortened, cooling down (about N seconds, 1–60), all providers failed. The frozen error middleware is unchanged (the subclass is still caught by it for OCR). A successful reply is byte-for-byte as before.
+- **E** `app/utils/provider_diag.py` (new, stdlib): `classify_failure` (circuit_open, rate_limited, server_error, http_error, bad_response, tls, dns, timeout, connect, other) and `safe_preview` (markup and URLs removed, 80 characters). The failover engine logs structured `provider_failover`, `provider_success` and `providers_exhausted` events (provider, kind, status, breaker state, duration; never a URL, query, body or secret). Provider logs use `safe_preview`; provider exception messages no longer echo response bodies.
+- **B (NOT implemented):** verified provider-refusal classification. The providers' real rejection formats could not be verified (no provider access; a documentation search returned nothing authoritative), so an HTTP 400 or an `Error:` body still counts as an ordinary provider failure. No message for "verified URL rejection" exists.
+**Decision notes (steelman):** tuning thresholds or recovery time alone was rejected (hides the accumulation defect); a third provider was out of scope; user-input rejection is not classified without verified formats, to avoid hiding real outages.
+**Files changed:** `app/core/circuit_breaker.py`, `app/core/exceptions.py`, `app/platform/failover.py`, `app/providers/url_providers.py`, `app/features/media/router.py` (`cmd_short` only), `app/utils/provider_diag.py` (new), `app/utils/short_links.py` (new), `tests/test_short_resilience.py` (new), `TESTING.md`, `PROJECT_CONTEXT.md`
+**Files NOT changed:** `middlewares/error.py` and `di.py` (frozen), `session/router.py` (frozen), `bootstrap.py`, `safe_url.py`, `network.py`, `telegram_text.py`, `/short expand` and all CHG-029 code, SSRF protections, OCR providers/service, `requirements.txt`. (The spec named `app/core/di.py`; the file is `app/middlewares/di.py`, protected.)
+**Known limitations:** No live verification against CleanURI or v.gd. Item B not implemented. Existing log field `error` of `provider_failover` is now a sanitised preview and new fields were added. Non-URL text sent to `/short` is still passed to the providers (not validated). Other shorteners are not detected. The cooldown message depends on the in-memory breaker (reset on restart). Because only consecutive failures count, a provider that alternates failure and success will never open its breaker.
+**Status:** COMPLETE locally; live retest pending
+
+---
+
 ## 11. VERIFICATION HISTORY
 
 ### Phase 0 — Forensic Verification (Read-Only)
@@ -944,6 +962,9 @@ All handlers using `parse_mode="HTML"` apply `html.escape()` to every user-contr
 
 ### CHG-029 Verification
 - Baseline CHG-028 ZIP SHA-256 `3a1bd41ed7bb4220a1b06a02a65ecd290cac147b36df5e740bb31070845bda2b` verified before work. Default sandbox: 593 passed, 179 skipped, 0 failed (136 subtests passed); `test_short_expand_ssrf.py` 88 passed, 7 skipped. Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d`; all protected files byte-identical to the CHG-028 baseline. Ruff on changed files: no new findings. Live Telegram behaviour not verified.
+
+### CHG-030 Verification
+- Baseline: CHG-029 ZIP SHA-256 `b0a3a69a9e1da3727268c5463b23706ebc9dfcf3f0a4794b1b25da3d16500fde`. Default sandbox: 648 passed, 179 skipped, 0 failed (187 subtests passed); `test_short_resilience.py` 55 passed; `test_short_expand_ssrf.py` 88 passed, 7 skipped (aiohttp); `test_telegram_text.py` 51 passed; `test_architecture.py` 66 passed, 14 skipped. Ruff: new files clean; changed existing files have one finding fewer than the baseline. Frozen `session/router.py` MD5 `c61dcc219b29736e228bdc1d0915d82d`; `error.py`, `di.py`, `bootstrap.py`, `safe_url.py` and the other protected files byte-identical to baseline. Live Telegram and live provider behaviour not verified. CHG-028 live tests (backtick, long-JSON boundary) remain separately pending.
 
 ## 12. KNOWN ISSUES
 

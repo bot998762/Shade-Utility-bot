@@ -21,9 +21,14 @@ from app.services.ocr_service import OCRService
 from app.services.shortener_service import ShortenerService
 from app.services.translator_service import TranslatorService
 from app.utils import qr
-from app.core.exceptions import ProviderAPIError
+from app.core.exceptions import (
+    NoProvidersAvailableError,
+    ProviderAPIError,
+    ProvidersCoolingDownError,
+)
 from app.core.logger import setup_logger
 from app.utils import safe_url as _su
+from app.utils import short_links as _sl
 from app.utils import telegram_text as _tt
 
 manifest = FeatureManifest(name="MediaTools", version="1.0.0", category="Utility")
@@ -149,8 +154,35 @@ async def cmd_short(
         await _cmd_short_expand(message, args[2].strip(), bootstrap_ref)
         return
 
-    # Existing shortening path — UNCHANGED
-    url = await shortener_service.shorten_url(args[1].strip())
+    # CHG-030 — shortening path. Known already-shortened links are refused before any
+    # provider is contacted (no request, no circuit-breaker effect), and failures
+    # are reported with distinct messages. A successful result is sent exactly as before.
+    target = args[1].strip()
+    short_host = _sl.known_short_link_host(target)
+    if short_host:
+        logger.info({"event": "short_already_shortened", "host": short_host})
+        await message.reply(
+            f"ℹ️ That link is already shortened ({_html.escape(short_host)}).\n"
+            "Shorten the original URL instead, or use "
+            "<code>/short expand &lt;link&gt;</code> to see where it leads.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        url = await shortener_service.shorten_url(target)
+    except ProvidersCoolingDownError as exc:
+        wait = max(1, min(60, int(exc.retry_after) + 1))
+        await message.reply(
+            "⏳ The URL shortening services are cooling down after recent errors. "
+            f"Please try again in about {wait} seconds."
+        )
+        return
+    except NoProvidersAvailableError:
+        await message.reply(
+            "⚠️ URL shortening is unavailable: every provider failed just now. "
+            "Please try again later."
+        )
+        return
     # Shortened URLs contain only safe chars; escape for correctness
     e_url = _html.escape(url)
     await message.reply(f"🌐 <b>Shortened Direct Link:</b>\n{e_url}", parse_mode="HTML")
